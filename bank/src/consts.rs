@@ -1,0 +1,1 @@
+pub const LAMPORTS_PER_SIGNATURE: u64 = 5000;
