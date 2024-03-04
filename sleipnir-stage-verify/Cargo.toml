@@ -1,0 +1,25 @@
+[package]
+name = "sleipnir-stage-verify"
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+itertools = { workspace = true }
+histogram = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+sleipnir-messaging = { workspace = true }
+sleipnir-streamer = { workspace = true }
+solana-frozen-abi-macro = { workspace = true }
+solana-measure = { workspace = true }
+solana-metrics = { workspace = true }
+solana-perf = { workspace = true }
+solana-sdk = { workspace = true }
+thiserror = { workspace = true }
