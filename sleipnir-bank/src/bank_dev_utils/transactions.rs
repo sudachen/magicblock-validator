@@ -1,12 +1,14 @@
 use std::collections::HashSet;
 
 use crate::bank::{Bank, TransactionExecutionRecordingOpts};
+use crate::transaction_results::TransactionBalancesSet;
 use crate::LAMPORTS_PER_SIGNATURE;
 use log::{debug, error, info, trace, warn};
 use rayon::{
     iter::IndexedParallelIterator,
     prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
 };
+use solana_accounts_db::transaction_results::TransactionResults;
 use solana_program_runtime::timings::ExecuteTimings;
 use solana_sdk::{
     account::Account,
@@ -31,6 +33,27 @@ use super::elfs;
 // -----------------
 pub fn create_accounts(num: usize) -> Vec<Keypair> {
     (0..num).into_par_iter().map(|_| Keypair::new()).collect()
+}
+
+pub fn create_funded_account(bank: &Bank, lamports: Option<u64>) -> Keypair {
+    let account = Keypair::new();
+    let lamports = lamports.unwrap_or_else(|| {
+        let rent_exempt_reserve = Rent::default().minimum_balance(0);
+        rent_exempt_reserve + LAMPORTS_PER_SIGNATURE
+    });
+
+    bank.store_account(
+        &account.pubkey(),
+        &Account {
+            lamports,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: Epoch::MAX,
+        },
+    );
+
+    account
 }
 
 pub fn create_funded_accounts(bank: &Bank, num: usize, lamports: Option<u64>) -> Vec<Keypair> {
@@ -59,6 +82,21 @@ pub fn create_funded_accounts(bank: &Bank, num: usize, lamports: Option<u64>) ->
 // -----------------
 // System Program
 // -----------------
+pub fn create_system_transfer_transaction(
+    bank: &Bank,
+    fund_lamports: u64,
+    send_lamports: u64,
+) -> (SanitizedTransaction, Pubkey, Pubkey) {
+    let from = create_funded_account(bank, Some(fund_lamports));
+    let to = Pubkey::new_unique();
+    let tx = system_transaction::transfer(&from, &to, send_lamports, bank.last_blockhash());
+    (
+        SanitizedTransaction::from_transaction_for_tests(tx),
+        from.pubkey(),
+        to,
+    )
+}
+
 pub fn create_system_transfer_transactions(bank: &Bank, num: usize) -> Vec<SanitizedTransaction> {
     let funded_accounts = create_funded_accounts(bank, 2 * num, None);
     funded_accounts
@@ -71,6 +109,22 @@ pub fn create_system_transfer_transactions(bank: &Bank, num: usize) -> Vec<Sanit
         })
         .map(SanitizedTransaction::from_transaction_for_tests)
         .collect()
+}
+
+pub fn create_system_allocate_transaction(
+    bank: &Bank,
+    fund_lamports: u64,
+    space: u64,
+) -> (SanitizedTransaction, Pubkey, Pubkey) {
+    let payer = create_funded_account(bank, Some(fund_lamports));
+    let rent_exempt_reserve = Rent::default().minimum_balance(space as usize);
+    let account = create_funded_account(bank, Some(rent_exempt_reserve));
+    let tx = system_transaction::allocate(&payer, &account, bank.last_blockhash(), space);
+    (
+        SanitizedTransaction::from_transaction_for_tests(tx),
+        payer.pubkey(),
+        account.pubkey(),
+    )
 }
 
 // Noop
@@ -92,16 +146,29 @@ fn create_noop_instruction(program_id: &Pubkey, funded_accounts: &[Keypair]) -> 
 }
 
 // SolanaX
-pub fn create_solx_send_post_transaction(bank: &Bank) -> SanitizedTransaction {
-    let funded_accounts = create_funded_accounts(bank, 2, Some(LAMPORTS_PER_SOL));
-    let instruction = create_solx_send_post_instruction(&elfs::solanax::id(), &funded_accounts);
-    let message = Message::new(&[instruction], Some(&funded_accounts[0].pubkey()));
-    let transaction = Transaction::new(
-        &[&funded_accounts[0], &funded_accounts[1]],
-        message,
-        bank.last_blockhash(),
-    );
-    SanitizedTransaction::try_from_legacy_transaction(transaction).unwrap()
+pub struct SolanaxPostAccounts {
+    pub post: Pubkey,
+    pub author: Pubkey,
+}
+pub fn create_solx_send_post_transaction(
+    bank: &Bank,
+) -> (SanitizedTransaction, SolanaxPostAccounts) {
+    let accounts = vec![
+        create_funded_account(bank, Some(Rent::default().minimum_balance(1180))),
+        create_funded_account(bank, Some(LAMPORTS_PER_SOL)),
+    ];
+    let post = &accounts[0];
+    let author = &accounts[1];
+    let instruction = create_solx_send_post_instruction(&elfs::solanax::id(), &accounts);
+    let message = Message::new(&[instruction], Some(&author.pubkey()));
+    let transaction = Transaction::new(&[author, post], message, bank.last_blockhash());
+    (
+        SanitizedTransaction::try_from_legacy_transaction(transaction).unwrap(),
+        SolanaxPostAccounts {
+            post: post.pubkey(),
+            author: author.pubkey(),
+        },
+    )
 }
 
 fn create_solx_send_post_instruction(
@@ -180,7 +247,10 @@ fn create_sysvars_from_account_instruction(
 // -----------------
 // Transactions
 // -----------------
-pub fn execute_transactions(bank: &Bank, txs: Vec<SanitizedTransaction>) {
+pub fn execute_transactions(
+    bank: &Bank,
+    txs: Vec<SanitizedTransaction>,
+) -> (TransactionResults, TransactionBalancesSet) {
     let batch = bank.prepare_sanitized_batch(&txs);
 
     let mut timings = ExecuteTimings::default();
@@ -248,4 +318,6 @@ pub fn execute_transactions(bank: &Bank, txs: Vec<SanitizedTransaction>) {
         }
     }
     info!("");
+
+    (transaction_results, transaction_balances)
 }

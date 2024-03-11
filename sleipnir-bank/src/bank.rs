@@ -129,7 +129,7 @@ pub struct Bank {
     pub rc: BankRc,
 
     /// Bank slot (i.e. block)
-    slot: Slot,
+    slot: AtomicU64,
 
     /// Bank epoch
     epoch: Epoch,
@@ -151,7 +151,7 @@ pub struct Bank {
 
     pub loaded_programs_cache: Arc<RwLock<LoadedPrograms<SimpleForkGraph>>>,
 
-    pub(super) transaction_processor: TransactionBatchProcessor<SimpleForkGraph>,
+    pub(crate) transaction_processor: RwLock<TransactionBatchProcessor<SimpleForkGraph>>,
 
     // Global configuration for how transaction logs should be collected across all banks
     pub transaction_log_collector_config: Arc<RwLock<TransactionLogCollectorConfig>>,
@@ -236,8 +236,9 @@ pub struct Bank {
     blockhash_queue: RwLock<BlockhashQueue>,
 
     /// The set of parents including this bank
-    /// NOTE: we're planning to only have this bank
-    pub ancestors: Ancestors,
+    /// NOTE: we only have one bank, but this is just a Bit representation
+    /// of a Vec<Slot> and seems necessary
+    pub ancestors: RwLock<Ancestors>,
 
     // -----------------
     // Synchronization
@@ -260,7 +261,7 @@ impl TransactionProcessingCallback for Bank {
         self.rc
             .accounts
             .accounts_db
-            .account_matches_owners(&self.ancestors, account, owners)
+            .account_matches_owners(&self.readlock_ancestors().unwrap(), account, owners)
             .ok()
     }
 
@@ -268,7 +269,7 @@ impl TransactionProcessingCallback for Bank {
         self.rc
             .accounts
             .accounts_db
-            .load_with_fixed_root(&self.ancestors, pubkey)
+            .load_with_fixed_root(&self.readlock_ancestors().unwrap(), pubkey)
             .map(|(acc, _)| acc)
     }
 
@@ -358,7 +359,7 @@ impl Bank {
 
         let accounts = Accounts::new(Arc::new(accounts_db));
         let mut bank = Self::default_with_accounts(accounts);
-        bank.ancestors = Ancestors::from(vec![bank.slot()]);
+        bank.ancestors = RwLock::new(Ancestors::from(vec![bank.slot()]));
         bank.transaction_debug_keys = debug_keys;
         bank.runtime_config = runtime_config;
 
@@ -414,7 +415,7 @@ impl Bank {
 
         let mut bank = Self {
             rc: BankRc::new(accounts, Slot::default()),
-            slot: Slot::default(),
+            slot: AtomicU64::default(),
             epoch: Epoch::default(),
             epoch_schedule: EpochSchedule::default(),
             is_delta: AtomicBool::default(),
@@ -426,7 +427,7 @@ impl Bank {
             transaction_log_collector: Arc::<RwLock<TransactionLogCollector>>::default(),
             fee_structure: FeeStructure::default(),
             loaded_programs_cache,
-            transaction_processor: TransactionBatchProcessor::default(),
+            transaction_processor: Default::default(),
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
 
             // Counters
@@ -451,7 +452,7 @@ impl Bank {
             slots_per_year: f64::default(),
 
             // For TransactionProcessingCallback
-            ancestors: Ancestors::default(),
+            ancestors: RwLock::new(Ancestors::default()),
             blockhash_queue: RwLock::<BlockhashQueue>::default(),
             feature_set: Arc::<FeatureSet>::default(),
             rent_collector: RentCollector::default(),
@@ -463,14 +464,14 @@ impl Bank {
             hash: RwLock::<Hash>::default(),
         };
 
-        bank.transaction_processor = TransactionBatchProcessor::new(
-            bank.slot,
+        bank.transaction_processor = RwLock::new(TransactionBatchProcessor::new(
+            bank.slot(),
             bank.epoch,
             bank.epoch_schedule.clone(),
             bank.fee_structure.clone(),
             bank.runtime_config.clone(),
             bank.loaded_programs_cache.clone(),
-        );
+        ));
 
         bank
     }
@@ -562,7 +563,7 @@ impl Bank {
         self.ticks_per_slot = genesis_config.ticks_per_slot();
         self.ns_per_slot = genesis_config.ns_per_slot();
         self.genesis_creation_time = genesis_config.creation_time;
-        self.max_tick_height = (self.slot + 1) * self.ticks_per_slot;
+        self.max_tick_height = (self.slot() + 1) * self.ticks_per_slot;
         self.slots_per_year = genesis_config.slots_per_year();
 
         self.epoch_schedule = genesis_config.epoch_schedule.clone();
@@ -574,23 +575,26 @@ impl Bank {
     }
 
     // -----------------
-    // Slot and Epoch
+    // Slot, Epoch and Ancestors
     // -----------------
     pub fn slot(&self) -> Slot {
-        self.slot
+        self.slot.load(Ordering::Relaxed)
     }
 
-    pub fn advance_slot(&mut self) {
-        self.slot += 1;
-        self.transaction_processor = TransactionBatchProcessor::new(
-            self.slot,
-            self.epoch,
-            self.epoch_schedule.clone(),
-            self.fee_structure.clone(),
-            self.runtime_config.clone(),
-            self.loaded_programs_cache.clone(),
-        );
+    fn set_slot(&self, slot: Slot) {
+        self.slot.store(slot, Ordering::Relaxed);
+    }
 
+    pub fn advance_slot(&self) {
+        let next_slot = self.slot() + 1;
+        self.set_slot(next_slot);
+        self.transaction_processor
+            .write()
+            .unwrap()
+            .set_slot(next_slot);
+        let mut slots = self.readlock_ancestors().unwrap().keys();
+        slots.push(next_slot);
+        *self.ancestors.write().unwrap() = Ancestors::from(slots);
         self.fill_missing_sysvar_cache_entries();
     }
 
@@ -600,6 +604,15 @@ impl Bank {
 
     pub fn epoch_schedule(&self) -> &EpochSchedule {
         &self.epoch_schedule
+    }
+
+    pub fn readlock_ancestors(
+        &self,
+    ) -> std::prelude::v1::Result<
+        RwLockReadGuard<'_, Ancestors>,
+        std::sync::PoisonError<RwLockReadGuard<'_, Ancestors>>,
+    > {
+        self.ancestors.read()
     }
 
     // -----------------
@@ -628,7 +641,7 @@ impl Bank {
     }
 
     pub fn get_account_modified_slot(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
-        self.load_slow(&self.ancestors, pubkey)
+        self.load_slow(&self.readlock_ancestors().unwrap(), pubkey)
     }
 
     pub fn get_account_with_fixed_root(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
@@ -640,7 +653,7 @@ impl Bank {
         &self,
         pubkey: &Pubkey,
     ) -> Option<(AccountSharedData, Slot)> {
-        self.load_slow_with_fixed_root(&self.ancestors, pubkey)
+        self.load_slow_with_fixed_root(&self.readlock_ancestors().unwrap(), pubkey)
     }
 
     fn load_slow(
@@ -817,11 +830,12 @@ impl Bank {
         // by the validator.
         let unix_timestamp = i64::try_from(get_epoch_secs()).expect("get_epoch_secs overflow");
 
+        let slot = self.slot();
         let clock = sysvar::clock::Clock {
-            slot: self.slot,
+            slot,
             epoch_start_timestamp,
-            epoch: self.epoch_schedule().get_epoch(self.slot),
-            leader_schedule_epoch: self.epoch_schedule().get_leader_schedule_epoch(self.slot),
+            epoch: self.epoch_schedule().get_epoch(slot),
+            leader_schedule_epoch: self.epoch_schedule().get_leader_schedule_epoch(slot),
             unix_timestamp,
         };
         self.update_sysvar_account(&sysvar::clock::id(), |account| {
@@ -1110,7 +1124,7 @@ impl Bank {
         self.add_builtin(
             program_id,
             name,
-            LoadedProgram::new_tombstone(self.slot, LoadedProgramType::Closed),
+            LoadedProgram::new_tombstone(self.slot(), LoadedProgramType::Closed),
         );
         debug!("Removed program {}", program_id);
     }
@@ -1241,6 +1255,8 @@ impl Bank {
         // 2. Load and execute sanitized transactions
         let sanitized_output = self
             .transaction_processor
+            .read()
+            .unwrap()
             .load_and_execute_sanitized_transactions(
                 self,
                 sanitized_txs,
@@ -1271,7 +1287,7 @@ impl Bank {
                 for key in tx.message().account_keys().iter() {
                     if debug_keys.contains(key) {
                         let result = execution_result.flattened_result();
-                        info!("slot: {} result: {:?} tx: {:?}", self.slot, result, tx);
+                        info!("slot: {} result: {:?} tx: {:?}", self.slot(), result, tx);
                         break;
                     }
                 }
@@ -1827,7 +1843,7 @@ impl Bank {
         // TODO: this currently behaves as if we had multiple banks and/or forks
         // we should simplify this to get info from the current bank only
         let rcache = self.status_cache.read().unwrap();
-        rcache.get_status_any_blockhash(signature, &self.ancestors)
+        rcache.get_status_any_blockhash(signature, &self.readlock_ancestors().unwrap())
     }
 
     pub fn get_signature_status(&self, signature: &Signature) -> Option<Result<()>> {

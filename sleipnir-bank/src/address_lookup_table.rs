@@ -18,6 +18,8 @@ impl AddressLoader for &Bank {
     ) -> Result<LoadedAddresses, AddressLoaderError> {
         let slot_hashes = self
             .transaction_processor
+            .read()
+            .unwrap()
             .sysvar_cache
             .read()
             .unwrap()
@@ -28,7 +30,7 @@ impl AddressLoader for &Bank {
             .iter()
             .map(|address_table_lookup| {
                 self.rc.accounts.load_lookup_table_addresses(
-                    &self.ancestors,
+                    &self.readlock_ancestors().unwrap(),
                     address_table_lookup,
                     &slot_hashes,
                 )
