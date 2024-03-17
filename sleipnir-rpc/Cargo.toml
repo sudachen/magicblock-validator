@@ -1,0 +1,40 @@
+[package]
+name = "sleipnir-rpc"
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+bs58 = { workspace = true }
+base64 = { workspace = true }
+bincode = { workspace = true }
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+jsonrpc-core = { workspace = true }
+jsonrpc-core-client = { workspace = true }
+jsonrpc-derive = { workspace = true }
+jsonrpc-http-server = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+sleipnir-bank = { workspace = true }
+sleipnir-rpc-client-api = { workspace = true }
+sleipnir-tokens = { workspace = true }
+sleipnir-version = { workspace = true }
+solana-account-decoder = { workspace = true }
+solana-accounts-db = { workspace = true }
+solana-metrics = { workspace = true }
+solana-perf = { workspace = true }
+solana-sdk = { workspace = true }
+# TODO: decide if we want to use sleipnir-transaction-status instead
+# and possibly have that crate just be a wrapper around solana-transaction-status
+solana-transaction-status = { workspace = true }
+
+spl-token-2022 = { workspace = true }
+
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+test-tools = { workspace = true }

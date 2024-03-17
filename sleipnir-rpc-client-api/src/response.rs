@@ -1,10 +1,10 @@
 // NOTE: from rpc-client-api/src/response.rs without vote/token related parts
-use std::{fmt, str::FromStr};
+use std::{fmt, net::SocketAddr, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use solana_account_decoder::UiAccount;
 use solana_sdk::{
-    clock::{Slot, UnixTimestamp},
+    clock::{Epoch, Slot, UnixTimestamp},
     transaction::{Result, TransactionError},
 };
 use solana_transaction_status::{
@@ -126,6 +126,13 @@ pub struct RpcBlockhash {
 // - RpcInflationGovernor
 // - RpcInflationRate
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcKeyedAccount {
+    pub pubkey: String,
+    pub account: UiAccount,
+}
+
 // NOTE: left out
 // - SlotInfo
 // - SlotTransactionStats
@@ -153,8 +160,30 @@ pub enum RpcSignatureResult {
     ReceivedSignature(ReceivedSignatureResult),
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcContactInfo {
+    /// Pubkey of the node as a base-58 string
+    pub pubkey: String,
+    /// Gossip port
+    pub gossip: Option<SocketAddr>,
+    /// Tpu UDP port
+    pub tpu: Option<SocketAddr>,
+    /// Tpu QUIC port
+    pub tpu_quic: Option<SocketAddr>,
+    /// JSON RPC port
+    pub rpc: Option<SocketAddr>,
+    /// WebSocket PubSub port
+    pub pubsub: Option<SocketAddr>,
+    /// Software version
+    pub version: Option<String>,
+    /// First 4 bytes of the FeatureSet identifier
+    pub feature_set: Option<u32>,
+    /// Shred version
+    pub shred_version: Option<u16>,
+}
+
 // NOTE: left out
-// - RpcContactInfo
 // - RpcBlockProductionRange
 // - RpcBlockProduction
 
@@ -197,10 +226,46 @@ pub struct RpcIdentity {
     pub identity: String,
 }
 
-// NOTE: left out
-// - RpcVote
-// - RpcVoteAccountStatus
-// - RpcVoteAccountInfo
+// NOTE: left out RpcVote
+
+// -----------------
+// RpcVoteAccountStatus
+// -----------------
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcVoteAccountStatus {
+    pub current: Vec<RpcVoteAccountInfo>,
+    pub delinquent: Vec<RpcVoteAccountInfo>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcVoteAccountInfo {
+    /// Vote account address, as base-58 encoded string
+    pub vote_pubkey: String,
+
+    /// The validator identity, as base-58 encoded string
+    pub node_pubkey: String,
+
+    /// The current stake, in lamports, delegated to this vote account
+    pub activated_stake: u64,
+
+    /// An 8-bit integer used as a fraction (commission/MAX_U8) for rewards payout
+    pub commission: u8,
+
+    /// Whether this account is staked for the current epoch
+    pub epoch_vote_account: bool,
+
+    /// Latest history of earned credits for up to `MAX_RPC_VOTE_ACCOUNT_INFO_EPOCH_CREDITS_HISTORY` epochs
+    ///   each tuple is (Epoch, credits, prev_credits)
+    pub epoch_credits: Vec<(Epoch, u64, u64)>,
+
+    /// Most recent slot voted on by this vote account (0 if no votes exist)
+    pub last_vote: u64,
+
+    /// Current root slot for this vote account (0 if no root slot exists)
+    pub root_slot: Slot,
+}
 
 // -----------------
 // RpcSignatureConfirmation
@@ -238,8 +303,16 @@ pub struct RpcAccountBalance {
     pub lamports: u64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcSupply {
+    pub total: u64,
+    pub circulating: u64,
+    pub non_circulating: u64,
+    pub non_circulating_accounts: Vec<String>,
+}
+
 // NOTE: left out
-// - RpcSupply
 // - StakeActivationState
 // - RpcStakeActivation
 // - RpcTokenAccountBalance
@@ -293,7 +366,18 @@ pub struct RpcPerfSample {
     pub sample_period_secs: u16,
 }
 
-// NOTE: left out RpcInflationReward
+// -----------------
+// RpcInflationReward
+// -----------------
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcInflationReward {
+    pub epoch: Epoch,
+    pub effective_slot: Slot,
+    pub amount: u64,            // lamports
+    pub post_balance: u64,      // lamports
+    pub commission: Option<u8>, // Vote account commission when the reward was credited
+}
 
 // -----------------
 // RpcBlockUpdate
@@ -324,6 +408,11 @@ pub struct RpcSnapshotSlotInfo {
     pub incremental: Option<Slot>,
 }
 
-// NOTE: left out RpcPrioritizationFee
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPrioritizationFee {
+    pub slot: Slot,
+    pub prioritization_fee: u64,
+}
 
 // NOTE: left out tests (rpc_perf_sample_serializes_num_non_vote_transactions)

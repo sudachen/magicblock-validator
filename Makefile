@@ -20,8 +20,14 @@ list:
 ex-clone-custom:
 	cargo run --package=sleipnir-mutator --example clone_solx_custom
 
+ex-rpc:
+	cargo run --package=sleipnir-rpc --example rpc
+
+ex-rpc-release:
+	cargo run --release --package=sleipnir-rpc --example rpc
+
 fmt:
 	cargo +nightly fmt -- --config-path rustfmt-nightly.toml
 
 .PHONY:
-	list test test-log test-bank fmt ex-clone-custom
+	list test test-log test-bank fmt ex-clone-custom ex-rpc ex-rpc-release

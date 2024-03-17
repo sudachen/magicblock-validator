@@ -14,9 +14,11 @@ use std::{
 
 use log::{debug, info, trace};
 use solana_accounts_db::{
-    accounts::{Accounts, TransactionLoadResult},
+    accounts::{Accounts, PubkeyAccountSlot, TransactionLoadResult},
     accounts_db::{AccountShrinkThreshold, AccountsDb, AccountsDbConfig},
-    accounts_index::{AccountSecondaryIndexes, ZeroLamport},
+    accounts_index::{
+        AccountSecondaryIndexes, IndexKey, ScanConfig, ScanResult, ZeroLamport,
+    },
     accounts_update_notifier_interface::AccountsUpdateNotifier,
     ancestors::Ancestors,
     blockhash_queue::BlockhashQueue,
@@ -44,7 +46,10 @@ use solana_sdk::{
         create_executable_meta, from_account, Account, AccountSharedData,
         ReadableAccount, WritableAccount,
     },
-    clock::{Epoch, Slot, UnixTimestamp, MAX_PROCESSING_AGE},
+    clock::{
+        BankId, Epoch, Slot, SlotIndex, UnixTimestamp, MAX_PROCESSING_AGE,
+    },
+    epoch_info::EpochInfo,
     epoch_schedule::EpochSchedule,
     feature,
     feature_set::{
@@ -53,7 +58,7 @@ use solana_sdk::{
     fee::FeeStructure,
     fee_calculator::FeeRateGovernor,
     genesis_config::GenesisConfig,
-    hash::Hash,
+    hash::{Hash, Hasher},
     message::SanitizedMessage,
     native_loader,
     nonce::{self, state::DurableNonce, NONCED_TX_MARKER_IX_INDEX},
@@ -143,6 +148,8 @@ pub struct Bank {
 
     /// Bank slot (i.e. block)
     slot: AtomicU64,
+
+    bank_id: BankId,
 
     /// Bank epoch
     epoch: Epoch,
@@ -443,6 +450,7 @@ impl Bank {
         let mut bank = Self {
             rc: BankRc::new(accounts, Slot::default()),
             slot: AtomicU64::default(),
+            bank_id: BankId::default(),
             epoch: Epoch::default(),
             epoch_schedule: EpochSchedule::default(),
             is_delta: AtomicBool::default(),
@@ -623,16 +631,43 @@ impl Bank {
     }
 
     pub fn advance_slot(&self) {
+        // 1. Determine next slot and set it
         let next_slot = self.slot() + 1;
         self.set_slot(next_slot);
+
+        // 2. Update transaction processor with new slot
         self.transaction_processor
             .write()
             .unwrap()
             .set_slot(next_slot);
+
+        // 3. update ancestors to include new slot
         let mut slots = self.readlock_ancestors().unwrap().keys();
         slots.push(next_slot);
         *self.ancestors.write().unwrap() = Ancestors::from(slots);
+
+        // 4. Update sysvars
+        self.update_clock(self.genesis_creation_time);
         self.fill_missing_sysvar_cache_entries();
+
+        // 5. Determine next blockhahs
+        let blockhash = {
+            // In the Solana implementation there is a lot of logic going on to determine the next
+            // blockhash, however we don't really produce any blocks, so any new hash will do.
+            // Therefore we derive it from the previous hash and the current slot.
+            let current_hash = self.last_blockhash();
+            let mut hasher = Hasher::default();
+            hasher.hash(current_hash.as_ref());
+            hasher.hash(&next_slot.to_le_bytes());
+            hasher.result()
+        };
+
+        // 6. Register the new blockhash with the blockhash queue
+        let mut blockhash_queue = self.blockhash_queue.write().unwrap();
+        blockhash_queue.register_hash(
+            &blockhash,
+            self.fee_rate_governor.lamports_per_signature,
+        );
     }
 
     pub fn epoch(&self) -> Epoch {
@@ -641,6 +676,44 @@ impl Bank {
 
     pub fn epoch_schedule(&self) -> &EpochSchedule {
         &self.epoch_schedule
+    }
+
+    /// given a slot, return the epoch and offset into the epoch this slot falls
+    /// e.g. with a fixed number for slots_per_epoch, the calculation is simply:
+    ///
+    ///  ( slot/slots_per_epoch, slot % slots_per_epoch )
+    pub fn get_epoch_and_slot_index(&self, slot: Slot) -> (Epoch, SlotIndex) {
+        self.epoch_schedule().get_epoch_and_slot_index(slot)
+    }
+
+    pub fn get_epoch_info(&self) -> EpochInfo {
+        let absolute_slot = self.slot();
+        let block_height = self.block_height();
+        let (epoch, slot_index) = self.get_epoch_and_slot_index(absolute_slot);
+        // One Epoch is roughly 2 days long and the Solana validator has a slot / 400ms
+        // So, 2 days * 24 hours * 60 minutes * 60 seconds / 0.4 seconds = 432,000 slots
+        let slots_in_epoch = self.get_slots_in_epoch(epoch);
+        let transaction_count = Some(self.transaction_count());
+        EpochInfo {
+            epoch,
+            slot_index,
+            slots_in_epoch,
+            absolute_slot,
+            block_height,
+            transaction_count,
+        }
+    }
+
+    /// Return the number of slots per epoch for the given epoch
+    pub fn get_slots_in_epoch(&self, epoch: Epoch) -> u64 {
+        self.epoch_schedule().get_slots_in_epoch(epoch)
+    }
+
+    /// Return the block_height of this bank
+    /// The number of blocks beneath the current block.
+    /// The first block after the genesis block has height one.
+    pub fn block_height(&self) -> u64 {
+        self.slot()
     }
 
     pub fn readlock_ancestors(
@@ -667,6 +740,20 @@ impl Bank {
     /// Return the last block hash registered.
     pub fn last_blockhash(&self) -> Hash {
         self.blockhash_queue.read().unwrap().last_hash()
+    }
+
+    pub fn get_blockhash_last_valid_block_height(
+        &self,
+        blockhash: &Hash,
+    ) -> Option<Slot> {
+        let blockhash_queue = self.blockhash_queue.read().unwrap();
+        // This calculation will need to be updated to consider epoch boundaries if BlockhashQueue
+        // length is made variable by epoch
+        blockhash_queue.get_hash_age(blockhash).map(|age| {
+            // Since we don't produce blocks ATM, we consider the current slot
+            // to be our block height
+            self.block_height() + blockhash_queue.get_max_age() as u64 - age
+        })
     }
 
     // -----------------
@@ -863,6 +950,85 @@ impl Bank {
     }
 
     // -----------------
+    // GetProgramAccounts
+    // -----------------
+    pub fn get_program_accounts(
+        &self,
+        program_id: &Pubkey,
+        config: &ScanConfig,
+    ) -> ScanResult<Vec<TransactionAccount>> {
+        self.rc.accounts.load_by_program(
+            &self.ancestors.read().unwrap(),
+            self.bank_id,
+            program_id,
+            config,
+        )
+    }
+
+    pub fn get_filtered_program_accounts<F: Fn(&AccountSharedData) -> bool>(
+        &self,
+        program_id: &Pubkey,
+        filter: F,
+        config: &ScanConfig,
+    ) -> ScanResult<Vec<TransactionAccount>> {
+        self.rc.accounts.load_by_program_with_filter(
+            &self.ancestors.read().unwrap(),
+            self.bank_id,
+            program_id,
+            filter,
+            config,
+        )
+    }
+
+    pub fn get_filtered_indexed_accounts<F: Fn(&AccountSharedData) -> bool>(
+        &self,
+        index_key: &IndexKey,
+        filter: F,
+        config: &ScanConfig,
+        byte_limit_for_scan: Option<usize>,
+    ) -> ScanResult<Vec<TransactionAccount>> {
+        self.rc.accounts.load_by_index_key_with_filter(
+            &self.ancestors.read().unwrap(),
+            self.bank_id,
+            index_key,
+            filter,
+            config,
+            byte_limit_for_scan,
+        )
+    }
+
+    pub fn account_indexes_include_key(&self, key: &Pubkey) -> bool {
+        self.rc.accounts.account_indexes_include_key(key)
+    }
+
+    /// Returns all the accounts this bank can load
+    pub fn get_all_accounts(&self) -> ScanResult<Vec<PubkeyAccountSlot>> {
+        self.rc
+            .accounts
+            .load_all(&self.ancestors.read().unwrap(), self.bank_id)
+    }
+
+    // Scans all the accounts this bank can load, applying `scan_func`
+    pub fn scan_all_accounts<F>(&self, scan_func: F) -> ScanResult<()>
+    where
+        F: FnMut(Option<(&Pubkey, AccountSharedData, Slot)>),
+    {
+        self.rc.accounts.scan_all(
+            &self.ancestors.read().unwrap(),
+            self.bank_id,
+            scan_func,
+        )
+    }
+
+    pub fn byte_limit_for_scans(&self) -> Option<usize> {
+        self.rc
+            .accounts
+            .accounts_db
+            .accounts_index
+            .scan_results_limit_bytes
+    }
+
+    // -----------------
     // SysVars
     // -----------------
     pub fn clock(&self) -> sysvar::clock::Clock {
@@ -885,6 +1051,9 @@ impl Bank {
         // by the validator.
         let unix_timestamp =
             i64::try_from(get_epoch_secs()).expect("get_epoch_secs overflow");
+
+        // I checked this against crate::bank_helpers::get_sys_time_in_secs();
+        // and confirmed that the timestamps match
 
         let slot = self.slot();
         let clock = sysvar::clock::Clock {
@@ -2150,6 +2319,21 @@ impl Bank {
     }
 
     // -----------------
+    // Health
+    // -----------------
+    /// Returns true when startup accounts hash verification has completed or never had to run in background.
+    pub fn get_startup_verification_complete(&self) -> &Arc<AtomicBool> {
+        // TODO(thlorenz): this seems to never get verified at this point, i.e. /health always
+        // returns 'unknown'
+        &self
+            .rc
+            .accounts
+            .accounts_db
+            .verify_accounts_hash_in_bg
+            .verified
+    }
+
+    // -----------------
     // Accessors
     // -----------------
     pub fn read_cost_tracker(
@@ -2168,5 +2352,10 @@ impl Bank {
     // at a time
     pub fn freeze_lock(&self) -> RwLockReadGuard<Hash> {
         self.hash.read().unwrap()
+    }
+
+    /// Return the total capitalization of the Bank
+    pub fn capitalization(&self) -> u64 {
+        self.capitalization.load(Ordering::Relaxed)
     }
 }
