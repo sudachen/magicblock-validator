@@ -5,18 +5,23 @@ use std::{
     time::Duration,
 };
 
+use crossbeam_channel::unbounded;
 use log::*;
 use sleipnir_bank::{bank::Bank, genesis_utils::create_genesis_config};
 use sleipnir_rpc::{
     json_rpc_request_processor::JsonRpcConfig, json_rpc_service::JsonRpcService,
 };
+use sleipnir_transaction_status::TransactionStatusSender;
 use solana_sdk::{signature::Keypair, signer::Signer};
 use test_tools::{
     account::{fund_account, fund_account_addr},
-    bank::bank_for_tests,
+    bank::bank_for_tests_with_paths,
     init_logger,
 };
+
+use crate::geyser::{init_geyser_service, GeyserTransactionNotifyListener};
 const LUZIFER: &str = "LuzifKo4E6QCF5r4uQmqbyko7zLS5WgayynivnCbtzk";
+mod geyser;
 
 fn fund_luzifer(bank: &Bank) {
     // TODO: we need to fund Luzifer at startup instead of doing it here
@@ -34,8 +39,26 @@ async fn main() {
     init_logger!();
 
     let genesis_config = create_genesis_config(u64::MAX).genesis_config;
+    let geyser_service =
+        init_geyser_service().expect("Failed to init geyser service");
+
+    let transaction_notifier = geyser_service
+        .get_transaction_notifier()
+        .expect("Failed to get transaction notifier from geyser service");
+
+    let (transaction_sndr, transaction_recvr) = unbounded();
+    let transaction_listener = GeyserTransactionNotifyListener::new(
+        transaction_notifier,
+        transaction_recvr,
+    );
+    transaction_listener.run();
+
     let bank = {
-        let bank = bank_for_tests(&genesis_config);
+        let bank = bank_for_tests_with_paths(
+            &genesis_config,
+            geyser_service.get_accounts_update_notifier(),
+            vec!["/tmp/sleipnir-rpc-bin"],
+        );
         Arc::new(bank)
     };
     fund_luzifer(&bank);
@@ -57,6 +80,9 @@ async fn main() {
     );
     let config = JsonRpcConfig {
         slot_duration: tick_duration,
+        transaction_status_sender: Some(TransactionStatusSender {
+            sender: transaction_sndr,
+        }),
         ..Default::default()
     };
     let _json_rpc_service =
