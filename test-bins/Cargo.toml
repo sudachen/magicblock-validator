@@ -11,11 +11,13 @@ edition.workspace = true
 
 crossbeam-channel = { workspace = true }
 log = { workspace = true }
+geyser-grpc-proto = { workspace = true }
 itertools = { workspace = true }
 sleipnir-bank = { workspace = true }
 sleipnir-geyser-plugin = { workspace = true }
 sleipnir-processor = { workspace = true }
 sleipnir-rpc = { workspace = true }
+sleipnir-rpc-pubsub = { workspace = true }
 sleipnir-transaction-status = { workspace = true }
 solana-geyser-plugin-manager = { workspace = true }
 solana-sdk = { workspace = true }
