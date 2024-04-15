@@ -18,6 +18,7 @@ use test_tools::{
     account::{fund_account, fund_account_addr},
     bank::bank_for_tests_with_paths,
     init_logger,
+    programs::load_programs_from_string_config,
 };
 
 use crate::geyser::{init_geyser_service, GeyserTransactionNotifyListener};
@@ -65,9 +66,15 @@ async fn main() {
         Arc::new(bank)
     };
     fund_luzifer(&bank);
+    load_programs_from_env(&bank).unwrap();
+
     let faucet_keypair = fund_faucet(&bank);
 
-    let tick_duration = Duration::from_millis(100);
+    let tick_millis = std::env::var("SLOT_MS")
+        .map(|s| s.parse::<u64>().expect("SLOT_MS needs to be a number"))
+        .unwrap_or(100);
+
+    let tick_duration = Duration::from_millis(tick_millis);
     info!(
         "Adding Slot ticker for {}ms slots",
         tick_duration.as_millis()
@@ -88,15 +95,18 @@ async fn main() {
 
         // This service needs to run on its own thread as otherwise it affects
         // other tokio runtimes, i.e. the one of the GeyserPlugin
-        let hdl = std::thread::spawn(move || {
-            let _json_rpc_service = JsonRpcService::new(
-                rpc_socket,
-                bank.clone(),
-                faucet_keypair,
-                config,
-            )
-            .unwrap();
-        });
+        let hdl = {
+            let bank = bank.clone();
+            std::thread::spawn(move || {
+                let _json_rpc_service = JsonRpcService::new(
+                    rpc_socket,
+                    bank,
+                    faucet_keypair,
+                    config,
+                )
+                .unwrap();
+            })
+        };
         info!(
             "Launched JSON RPC service with pid {} at {:?}",
             process::id(),
@@ -108,6 +118,7 @@ async fn main() {
     RpcPubsubService::spawn(
         RpcPubsubConfig::default(),
         geyser_rpc_service.clone(),
+        bank.clone(),
     );
 
     json_rpc_service.join().unwrap();
@@ -119,4 +130,14 @@ fn init_slot_ticker(bank: Arc<Bank>, tick_duration: Duration) {
         std::thread::sleep(tick_duration);
         bank.advance_slot();
     });
+}
+
+fn load_programs_from_env(
+    bank: &Bank,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(programs) = std::env::var("PROGRAMS").ok() {
+        Ok(load_programs_from_string_config(bank, &programs)?)
+    } else {
+        Ok(())
+    }
 }

@@ -13,7 +13,7 @@ use solana_sdk::commitment_config::CommitmentLevel;
 // AccountParams
 // -----------------
 #[derive(Serialize, Deserialize, Debug)]
-pub struct AccountParams(String, RpcAccountInfoConfig);
+pub struct AccountParams(String, Option<RpcAccountInfoConfig>);
 
 #[allow(unused)]
 impl AccountParams {
@@ -22,18 +22,20 @@ impl AccountParams {
     }
 
     pub fn encoding(&self) -> Option<UiAccountEncoding> {
-        self.config().encoding
+        self.config().as_ref().and_then(|x| x.encoding)
     }
 
     pub fn commitment(&self) -> Option<CommitmentLevel> {
-        self.config().commitment.map(|c| c.commitment)
+        self.config()
+            .as_ref()
+            .and_then(|x| x.commitment.map(|c| c.commitment))
     }
 
     pub fn data_slice_config(&self) -> Option<UiDataSliceConfig> {
-        self.config().data_slice
+        self.config().as_ref().and_then(|x| x.data_slice)
     }
 
-    fn config(&self) -> &RpcAccountInfoConfig {
+    fn config(&self) -> &Option<RpcAccountInfoConfig> {
         &self.1
     }
 }
@@ -42,14 +44,14 @@ impl AccountParams {
 // SignatureParams
 // -----------------
 #[derive(Serialize, Deserialize, Debug)]
-pub struct SignatureParams(String, RpcSignatureSubscribeConfig);
+pub struct SignatureParams(String, Option<RpcSignatureSubscribeConfig>);
 impl SignatureParams {
     pub fn signature(&self) -> &str {
         &self.0
     }
 
     #[allow(unused)]
-    pub fn config(&self) -> &RpcSignatureSubscribeConfig {
+    pub fn config(&self) -> &Option<RpcSignatureSubscribeConfig> {
         &self.1
     }
 }

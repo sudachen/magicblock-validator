@@ -5,8 +5,10 @@ use sleipnir_rpc_client_api::{
     config::{
         RpcBlocksConfigWrapper, RpcContextConfig, RpcEncodingConfigWrapper,
         RpcEpochConfig, RpcRequestAirdropConfig, RpcSendTransactionConfig,
-        RpcSignaturesForAddressConfig, RpcTransactionConfig,
+        RpcSignatureStatusConfig, RpcSignaturesForAddressConfig,
+        RpcTransactionConfig,
     },
+    request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
     response::{
         Response as RpcResponse, RpcBlockhash,
         RpcConfirmedTransactionStatusWithSignature, RpcContactInfo,
@@ -16,10 +18,13 @@ use sleipnir_rpc_client_api::{
 use solana_sdk::{
     clock::{Slot, UnixTimestamp, MAX_RECENT_BLOCKHASHES},
     commitment_config::CommitmentConfig,
+    message::{SanitizedMessage, SanitizedVersionedMessage, VersionedMessage},
+    signature::Signature,
     transaction::VersionedTransaction,
 };
 use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding,
+    EncodedConfirmedTransactionWithStatusMeta, TransactionBinaryEncoding,
+    TransactionStatus, UiTransactionEncoding,
 };
 
 use crate::{
@@ -29,6 +34,7 @@ use crate::{
         decode_and_deserialize, sanitize_transaction, send_transaction,
         verify_signature,
     },
+    utils::new_response,
 };
 
 // Solana shows the last 60secs worth of samples
@@ -80,6 +86,35 @@ impl Full for FullImpl {
             })
             .collect();
         Ok(samples)
+    }
+
+    fn get_signature_statuses(
+        &self,
+        meta: Self::Metadata,
+        signature_strs: Vec<String>,
+        config: Option<RpcSignatureStatusConfig>,
+    ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
+        debug!(
+            "get_signature_statuses rpc request received: {:?}",
+            signature_strs.len()
+        );
+        if signature_strs.len() > MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS {
+            return Box::pin(future::err(Error::invalid_params(format!(
+                    "Too many inputs provided; max {MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS}"
+                ))));
+        }
+        let mut signatures: Vec<Signature> = vec![];
+        for signature_str in signature_strs {
+            match verify_signature(&signature_str) {
+                Ok(signature) => {
+                    signatures.push(signature);
+                }
+                Err(err) => return Box::pin(future::err(err)),
+            }
+        }
+        Box::pin(async move {
+            meta.get_signature_statuses(signatures, config).await
+        })
     }
 
     fn get_max_retransmit_slot(&self, meta: Self::Metadata) -> Result<Slot> {
@@ -259,7 +294,27 @@ impl Full for FullImpl {
         data: String,
         config: Option<RpcContextConfig>,
     ) -> Result<RpcResponse<Option<u64>>> {
-        todo!("get_fee_for_message")
+        debug!("get_fee_for_message rpc request received");
+        let (_, message) = decode_and_deserialize::<VersionedMessage>(
+            data,
+            TransactionBinaryEncoding::Base64,
+        )?;
+        let bank = &*meta.get_bank_with_config(config.unwrap_or_default())?;
+        let sanitized_versioned_message =
+            SanitizedVersionedMessage::try_from(message).map_err(|err| {
+                Error::invalid_params(format!(
+                    "invalid transaction message: {err}"
+                ))
+            })?;
+        let sanitized_message =
+            SanitizedMessage::try_new(sanitized_versioned_message, bank)
+                .map_err(|err| {
+                    Error::invalid_params(format!(
+                        "invalid transaction message: {err}"
+                    ))
+                })?;
+        let fee = bank.get_fee_for_message(&sanitized_message);
+        Ok(new_response(bank, fee))
     }
 
     fn get_stake_minimum_delegation(
