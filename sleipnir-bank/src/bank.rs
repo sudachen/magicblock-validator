@@ -155,6 +155,9 @@ pub struct Bank {
     /// Bank epoch
     epoch: Epoch,
 
+    /// Validator Identity
+    identity_id: Pubkey,
+
     /// initialized from genesis
     pub(crate) epoch_schedule: EpochSchedule,
 
@@ -384,7 +387,7 @@ impl Bank {
         accounts_db_config: Option<AccountsDbConfig>,
         accounts_update_notifier: Option<AccountsUpdateNotifier>,
         slot_status_notifier: Option<SlotStatusNotifierArc>,
-        #[allow(unused)] collector_id_for_tests: Option<Pubkey>,
+        identity_id: Pubkey,
         exit: Arc<AtomicBool>,
     ) -> Self {
         let accounts_db = AccountsDb::new_with_config(
@@ -404,10 +407,7 @@ impl Bank {
         bank.runtime_config = runtime_config;
         bank.slot_status_notifier = slot_status_notifier;
 
-        #[cfg(not(feature = "dev-context-only-utils"))]
-        bank.process_genesis_config(genesis_config);
-        #[cfg(feature = "dev-context-only-utils")]
-        bank.process_genesis_config(genesis_config, collector_id_for_tests);
+        bank.process_genesis_config(genesis_config, identity_id);
 
         bank.finish_init(
             genesis_config,
@@ -436,6 +436,9 @@ impl Bank {
         // in our case we'd need to find a way to update at least the clock more regularly and set
         // it via bank.transaction_processor.sysvar_cache.write().unwrap().set_clock(), etc.
         bank.fill_missing_sysvar_cache_entries();
+
+        // We don't have anything to verify at this point, so declare it done
+        bank.set_startup_verification_complete();
 
         bank
     }
@@ -474,6 +477,7 @@ impl Bank {
             loaded_programs_cache,
             transaction_processor: Default::default(),
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
+            identity_id: Pubkey::default(),
 
             // Counters
             transaction_count: AtomicU64::default(),
@@ -562,24 +566,33 @@ impl Bank {
             }
         }
 
+        {
+            let mut loaded_programs_cache =
+                self.loaded_programs_cache.write().unwrap();
+            loaded_programs_cache.environments.program_runtime_v1 = Arc::new(
+                create_program_runtime_environment_v1(
+                    &self.feature_set,
+                    &self.runtime_config.compute_budget.unwrap_or_default(),
+                    false, /* deployment */
+                    false, /* debugging_features */
+                )
+                .unwrap(),
+            );
+            loaded_programs_cache.environments.program_runtime_v2 =
+                Arc::new(create_program_runtime_environment_v2(
+                    &self.runtime_config.compute_budget.unwrap_or_default(),
+                    false, /* debugging_features */
+                ));
+        }
+
+        self.sync_loaded_programs_cache_to_slot();
+    }
+
+    fn sync_loaded_programs_cache_to_slot(&self) {
         let mut loaded_programs_cache =
             self.loaded_programs_cache.write().unwrap();
         loaded_programs_cache.latest_root_slot = self.slot();
         loaded_programs_cache.latest_root_epoch = self.epoch();
-        loaded_programs_cache.environments.program_runtime_v1 = Arc::new(
-            create_program_runtime_environment_v1(
-                &self.feature_set,
-                &self.runtime_config.compute_budget.unwrap_or_default(),
-                false, /* deployment */
-                false, /* debugging_features */
-            )
-            .unwrap(),
-        );
-        loaded_programs_cache.environments.program_runtime_v2 =
-            Arc::new(create_program_runtime_environment_v2(
-                &self.runtime_config.compute_budget.unwrap_or_default(),
-                false, /* debugging_features */
-            ));
     }
 
     // -----------------
@@ -588,8 +601,7 @@ impl Bank {
     fn process_genesis_config(
         &mut self,
         genesis_config: &GenesisConfig,
-        #[cfg(feature = "dev-context-only-utils")]
-        collector_id_for_tests: Option<Pubkey>,
+        identity_id: Pubkey,
     ) {
         // Bootstrap validator collects fees until `new_from_parent` is called.
         self.fee_rate_governor = genesis_config.fee_rate_governor.clone();
@@ -622,12 +634,17 @@ impl Bank {
         self.slots_per_year = genesis_config.slots_per_year();
 
         self.epoch_schedule = genesis_config.epoch_schedule.clone();
+        self.identity_id = identity_id;
 
         // Add additional builtin programs specified in the genesis config
         for (name, program_id) in &genesis_config.native_instruction_processors
         {
             self.add_builtin_account(name, program_id, false);
         }
+    }
+
+    pub fn get_identity(&self) -> Pubkey {
+        self.identity_id
     }
 
     // -----------------
@@ -661,7 +678,7 @@ impl Bank {
         self.update_clock(self.genesis_creation_time);
         self.fill_missing_sysvar_cache_entries();
 
-        // 5. Determine next blockhahs
+        // 5. Determine next blockhash
         let blockhash = {
             // In the Solana implementation there is a lot of logic going on to determine the next
             // blockhash, however we don't really produce any blocks, so any new hash will do.
@@ -685,6 +702,9 @@ impl Bank {
             slot_status_notifier
                 .notify_slot_status(next_slot, Some(next_slot - 1));
         }
+
+        // 8. Update loaded programs cache as otherwise we cannot deploy new programs
+        self.sync_loaded_programs_cache_to_slot();
     }
 
     pub fn epoch(&self) -> Epoch {
@@ -1088,6 +1108,7 @@ impl Bank {
                 inherit_specially_retained_account_fields(account),
             )
         });
+        self.set_clock_in_sysvar_cache(clock);
     }
 
     fn update_rent(&self) {
@@ -2340,14 +2361,20 @@ impl Bank {
     // -----------------
     /// Returns true when startup accounts hash verification has completed or never had to run in background.
     pub fn get_startup_verification_complete(&self) -> &Arc<AtomicBool> {
-        // TODO(thlorenz): this seems to never get verified at this point, i.e. /health always
-        // returns 'unknown'
         &self
             .rc
             .accounts
             .accounts_db
             .verify_accounts_hash_in_bg
             .verified
+    }
+
+    pub fn set_startup_verification_complete(&self) {
+        self.rc
+            .accounts
+            .accounts_db
+            .verify_accounts_hash_in_bg
+            .verification_complete()
     }
 
     // -----------------

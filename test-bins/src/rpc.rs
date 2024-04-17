@@ -7,7 +7,10 @@ use std::{
 
 use crossbeam_channel::unbounded;
 use log::*;
-use sleipnir_bank::{bank::Bank, genesis_utils::create_genesis_config};
+use sleipnir_bank::{
+    bank::Bank,
+    genesis_utils::{create_genesis_config, GenesisConfigInfo},
+};
 use sleipnir_rpc::{
     json_rpc_request_processor::JsonRpcConfig, json_rpc_service::JsonRpcService,
 };
@@ -40,7 +43,11 @@ fn fund_faucet(bank: &Bank) -> Keypair {
 async fn main() {
     init_logger!();
 
-    let genesis_config = create_genesis_config(u64::MAX).genesis_config;
+    let GenesisConfigInfo {
+        genesis_config,
+        validator_pubkey,
+        ..
+    } = create_genesis_config(u64::MAX);
     let (geyser_service, geyser_rpc_service) = init_geyser_service()
         .await
         .expect("Failed to init geyser service");
@@ -61,6 +68,7 @@ async fn main() {
             &genesis_config,
             geyser_service.get_accounts_update_notifier(),
             geyser_service.get_slot_status_notifier(),
+            validator_pubkey,
             vec!["/tmp/sleipnir-rpc-bin"],
         );
         Arc::new(bank)
@@ -81,17 +89,21 @@ async fn main() {
     );
     init_slot_ticker(bank.clone(), tick_duration);
 
+    let pubsub_config = RpcPubsubConfig::default();
     // JSON RPC Service
     let json_rpc_service = {
+        let rpc_socket_addr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8899);
         let config = JsonRpcConfig {
             slot_duration: tick_duration,
             transaction_status_sender: Some(TransactionStatusSender {
                 sender: transaction_sndr,
             }),
+            rpc_socket_addr: Some(rpc_socket_addr),
+            pubsub_socket_addr: Some(*pubsub_config.socket()),
+
             ..Default::default()
         };
-        let rpc_socket =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8899);
 
         // This service needs to run on its own thread as otherwise it affects
         // other tokio runtimes, i.e. the one of the GeyserPlugin
@@ -99,9 +111,9 @@ async fn main() {
             let bank = bank.clone();
             std::thread::spawn(move || {
                 let _json_rpc_service = JsonRpcService::new(
-                    rpc_socket,
                     bank,
                     faucet_keypair,
+                    genesis_config.hash(),
                     config,
                 )
                 .unwrap();
@@ -110,13 +122,13 @@ async fn main() {
         info!(
             "Launched JSON RPC service with pid {} at {:?}",
             process::id(),
-            rpc_socket
+            rpc_socket_addr
         );
         hdl
     };
     // PubSub Service
     RpcPubsubService::spawn(
-        RpcPubsubConfig::default(),
+        pubsub_config,
         geyser_rpc_service.clone(),
         bank.clone(),
     );
@@ -135,7 +147,7 @@ fn init_slot_ticker(bank: Arc<Bank>, tick_duration: Duration) {
 fn load_programs_from_env(
     bank: &Bank,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(programs) = std::env::var("PROGRAMS").ok() {
+    if let Ok(programs) = std::env::var("PROGRAMS") {
         Ok(load_programs_from_string_config(bank, &programs)?)
     } else {
         Ok(())

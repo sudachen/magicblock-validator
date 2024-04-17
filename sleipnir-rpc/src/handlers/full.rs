@@ -55,13 +55,6 @@ impl Full for FullImpl {
         todo!("get_inflation_reward")
     }
 
-    fn get_cluster_nodes(
-        &self,
-        meta: Self::Metadata,
-    ) -> Result<Vec<RpcContactInfo>> {
-        todo!("get_cluster_nodes")
-    }
-
     fn get_recent_performance_samples(
         &self,
         meta: Self::Metadata,
@@ -70,7 +63,7 @@ impl Full for FullImpl {
         debug!("get_recent_performance_samples request received");
 
         // TODO(thlorenz): we don't have a blockstore, so we just make up some numbers here
-        let bank = meta.get_bank()?;
+        let bank = meta.get_bank();
         let num_slots = RECENT_PERF_SAMPLES_WINDOW_MILLIS
             / meta.config.slot_duration.as_millis() as u32;
         let current_slot = bank.slot();
@@ -78,6 +71,7 @@ impl Full for FullImpl {
         let samples = (min_slot..=current_slot)
             .map(|slot| RpcPerfSample {
                 slot,
+                // TODO(thlorenz): @@@blockstore once we support it we can provide this
                 num_transactions: 0,
                 sample_period_secs: (RECENT_PERF_SAMPLES_WINDOW_MILLIS / 1000)
                     as u16,
@@ -86,6 +80,14 @@ impl Full for FullImpl {
             })
             .collect();
         Ok(samples)
+    }
+
+    fn get_cluster_nodes(
+        &self,
+        meta: Self::Metadata,
+    ) -> Result<Vec<RpcContactInfo>> {
+        debug!("get_cluster_nodes rpc request received");
+        Ok(meta.get_cluster_nodes())
     }
 
     fn get_signature_statuses(

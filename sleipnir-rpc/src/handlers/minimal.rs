@@ -2,17 +2,22 @@
 use jsonrpc_core::Result;
 use log::*;
 use sleipnir_rpc_client_api::{
-    config::{RpcContextConfig, RpcGetVoteAccountsConfig},
+    config::{
+        RpcContextConfig, RpcGetVoteAccountsConfig, RpcLeaderScheduleConfig,
+        RpcLeaderScheduleConfigWrapper,
+    },
+    custom_error::RpcCustomError,
     response::{
-        Response as RpcResponse, RpcIdentity, RpcSnapshotSlotInfo,
-        RpcVersionInfo, RpcVoteAccountStatus,
+        Response as RpcResponse, RpcIdentity, RpcLeaderSchedule,
+        RpcSnapshotSlotInfo, RpcVersionInfo, RpcVoteAccountStatus,
     },
 };
 use solana_sdk::{epoch_info::EpochInfo, slot_history::Slot};
 
 use crate::{
     json_rpc_request_processor::JsonRpcRequestProcessor,
-    traits::rpc_minimal::Minimal,
+    rpc_health::RpcHealthStatus, traits::rpc_minimal::Minimal,
+    utils::verify_pubkey,
 };
 
 pub struct MinimalImpl;
@@ -40,15 +45,26 @@ impl Minimal for MinimalImpl {
     }
 
     fn get_genesis_hash(&self, meta: Self::Metadata) -> Result<String> {
-        todo!("get_genesis_hash")
+        debug!("get_genesis_hash rpc request received");
+        Ok(meta.genesis_hash.to_string())
     }
 
     fn get_health(&self, meta: Self::Metadata) -> Result<String> {
-        todo!("get_health")
+        match meta.health.check() {
+            RpcHealthStatus::Ok => Ok("ok".to_string()),
+            RpcHealthStatus::Unknown => Err(RpcCustomError::NodeUnhealthy {
+                num_slots_behind: None,
+            }
+            .into()),
+        }
     }
 
     fn get_identity(&self, meta: Self::Metadata) -> Result<RpcIdentity> {
-        todo!("get_identity")
+        debug!("get_identity rpc request received");
+        let identity = meta.get_identity();
+        Ok(RpcIdentity {
+            identity: identity.to_string(),
+        })
     }
 
     fn get_slot(
@@ -103,5 +119,37 @@ impl Minimal for MinimalImpl {
             solana_core: version.to_string(),
             feature_set: Some(version.feature_set),
         })
+    }
+
+    fn get_leader_schedule(
+        &self,
+        meta: Self::Metadata,
+        options: Option<RpcLeaderScheduleConfigWrapper>,
+        config: Option<RpcLeaderScheduleConfig>,
+    ) -> Result<Option<RpcLeaderSchedule>> {
+        let (slot, wrapped_config) =
+            options.as_ref().map(|x| x.unzip()).unwrap_or_default();
+        let config = wrapped_config.or(config).unwrap_or_default();
+
+        let identity = meta.get_identity().to_string();
+
+        if let Some(ref requested_identity) = config.identity {
+            let _ = verify_pubkey(requested_identity)?;
+            // We are the only leader around
+            if requested_identity != &identity {
+                return Ok(None);
+            }
+        }
+
+        let bank = meta.get_bank();
+        let slot = slot.unwrap_or_else(|| bank.slot());
+        let epoch = bank.epoch_schedule().get_epoch(slot);
+        let slots_in_epoch = bank.get_slots_in_epoch(epoch);
+
+        // We are always the leader thus we add every slot in the epoch
+        let slots = (0..slots_in_epoch as usize).collect::<Vec<_>>();
+        let leader_schedule = [(identity, slots)].into();
+
+        Ok(Some(leader_schedule))
     }
 }
