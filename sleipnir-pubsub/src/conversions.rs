@@ -10,7 +10,7 @@ use sleipnir_rpc_client_api::config::{
 };
 use solana_sdk::{account::Account, pubkey::Pubkey};
 
-use crate::pubsub_types::SlotResponse;
+use crate::types::SlotResponse;
 
 pub fn geyser_sub_for_transaction_signature(
     signature: String,

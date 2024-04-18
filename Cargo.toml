@@ -12,10 +12,10 @@ members = [
   "sleipnir-messaging",
   "sleipnir-mutator",
   "sleipnir-processor",
+  "sleipnir-pubsub",
   "sleipnir-rpc",
   "sleipnir-rpc-client",
   "sleipnir-rpc-client-api",
-  "sleipnir-rpc-pubsub",
   "sleipnir-stage-banking",
   "sleipnir-stage-fetch",
   "sleipnir-stage-verify",
@@ -50,6 +50,7 @@ base64 = "0.21.7"
 bincode = "1.3.3"
 bs58 = "0.4.0"
 cargo-lock = "9.0.0"
+console-subscriber = "0.2.0"
 crossbeam-channel = "0.5.11"
 csv = "1.3.0"
 eager = "0.1.0"
@@ -92,10 +93,10 @@ sleipnir-messaging = { path = "./sleipnir-messaging" }
 sleipnir-mutator = { path = "./sleipnir-mutator" }
 sleipnir-processor = { path = "./sleipnir-processor" }
 sleipnir-program = { path = "./programs/sleipnir" }
+sleipnir-pubsub = { path = "./sleipnir-pubsub" }
 sleipnir-rpc = { path = "./sleipnir-rpc" }
 sleipnir-rpc-client = { path = "./sleipnir-rpc-client" }
 sleipnir-rpc-client-api = { path = "./sleipnir-rpc-client-api" }
-sleipnir-rpc-pubsub = { path = "./sleipnir-rpc-pubsub" }
 sleipnir-rpc-sender = { path = "./sleipnir-rpc-sender" }
 sleipnir-stage-banking = { path = "./sleipnir-stage-banking" }
 sleipnir-stage-verify = { path = "./sleipnir-stage-verify" }
@@ -133,6 +134,7 @@ thiserror = "1.0.57"
 # Update solana-tokio patch below when updating this version
 tokio = "1.29.1"
 tokio-stream = "0.1.15"
+tokio-util = "0.7.10"
 # Tonic version 11 conflicts with lower level deps of solana
 tonic = "0.10.2"
 tonic-build = "0.10.2"

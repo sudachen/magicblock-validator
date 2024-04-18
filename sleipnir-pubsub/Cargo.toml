@@ -1,5 +1,5 @@
 [package]
-name = "sleipnir-rpc-pubsub"
+name = "sleipnir-pubsub"
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -19,4 +19,6 @@ sleipnir-bank = { workspace = true }
 sleipnir-geyser-plugin = { workspace = true }
 sleipnir-rpc-client-api = { workspace = true }
 solana-sdk = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
