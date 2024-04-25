@@ -10,6 +10,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use jsonrpc_core::{Error, ErrorCode, Metadata, Result, Value};
 use log::*;
 use sleipnir_bank::bank::Bank;
+use sleipnir_ledger::{Ledger, SignatureInfosForAddress};
 use sleipnir_rpc_client_api::{
     config::{
         RpcAccountInfoConfig, RpcContextConfig, RpcEncodingConfigWrapper,
@@ -19,7 +20,8 @@ use sleipnir_rpc_client_api::{
     custom_error::RpcCustomError,
     filter::RpcFilterType,
     response::{
-        OptionalContext, Response as RpcResponse, RpcBlockhash, RpcContactInfo,
+        OptionalContext, Response as RpcResponse, RpcBlockhash,
+        RpcConfirmedTransactionStatusWithSignature, RpcContactInfo,
         RpcKeyedAccount, RpcSupply,
     },
 };
@@ -33,8 +35,8 @@ use solana_sdk::{
     signature::{Keypair, Signature},
 };
 use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, TransactionStatus,
-    UiTransactionEncoding,
+    EncodedConfirmedTransactionWithStatusMeta, TransactionConfirmationStatus,
+    TransactionStatus, UiTransactionEncoding,
 };
 
 use crate::{
@@ -77,9 +79,10 @@ pub struct JsonRpcConfig {
 #[derive(Clone)]
 pub struct JsonRpcRequestProcessor {
     bank: Arc<Bank>,
+    pub(crate) ledger: Arc<Ledger>,
+    pub(crate) health: Arc<RpcHealth>,
     pub(crate) config: JsonRpcConfig,
     transaction_sender: Arc<Mutex<Sender<TransactionInfo>>>,
-    pub(crate) health: Arc<RpcHealth>,
     pub(crate) genesis_hash: Hash,
     pub faucet_keypair: Arc<Keypair>,
 }
@@ -88,6 +91,7 @@ impl Metadata for JsonRpcRequestProcessor {}
 impl JsonRpcRequestProcessor {
     pub fn new(
         bank: Arc<Bank>,
+        ledger: Arc<Ledger>,
         health: Arc<RpcHealth>,
         faucet_keypair: Keypair,
         genesis_hash: Hash,
@@ -98,14 +102,71 @@ impl JsonRpcRequestProcessor {
         (
             Self {
                 bank,
+                ledger,
+                health,
                 config,
                 transaction_sender,
-                health,
                 faucet_keypair: Arc::new(faucet_keypair),
                 genesis_hash,
             },
             receiver,
         )
+    }
+
+    // -----------------
+    // Transaction Signatures
+    // -----------------
+    pub async fn get_signatures_for_address(
+        &self,
+        address: Pubkey,
+        before: Option<Signature>,
+        until: Option<Signature>,
+        limit: usize,
+        config: RpcContextConfig,
+    ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+        let upper_limit = before;
+        let lower_limit = until;
+
+        let highest_slot = {
+            let min_context_slot = config.min_context_slot.unwrap_or_default();
+            let bank_slot = self.bank.slot();
+            if bank_slot < min_context_slot {
+                return Err(RpcCustomError::MinContextSlotNotReached {
+                    context_slot: bank_slot,
+                }
+                .into());
+            }
+            bank_slot
+        };
+
+        let SignatureInfosForAddress { infos, .. } = self
+            .ledger
+            .get_confirmed_signatures_for_address(
+                address,
+                highest_slot,
+                upper_limit,
+                lower_limit,
+                limit,
+            )
+            .map_err(|err| Error::invalid_params(format!("{err}")))?;
+
+        // NOTE: we don't support bigtable
+
+        let results = infos
+            .into_iter()
+            .map(|x| {
+                let mut item: RpcConfirmedTransactionStatusWithSignature =
+                    x.into();
+                // We don't have confirmation status, so we give it the most finalized one
+                item.confirmation_status =
+                    Some(TransactionConfirmationStatus::Finalized);
+                // We assume that the blocktime is always available instead of trying
+                // to resolve it via some bank forks (which we don't have)
+                item
+            })
+            .collect();
+
+        Ok(results)
     }
 
     // -----------------
@@ -426,20 +487,35 @@ impl JsonRpcRequestProcessor {
 
     pub async fn get_transaction(
         &self,
-        _signature: Signature,
+        signature: Signature,
         config: Option<RpcEncodingConfigWrapper<RpcTransactionConfig>>,
     ) -> Result<Option<EncodedConfirmedTransactionWithStatusMeta>> {
         let config = config
             .map(|config| config.convert_to_current())
             .unwrap_or_default();
-        let _encoding = config.encoding.unwrap_or(UiTransactionEncoding::Json);
-        // Omit commitment checks
+        let encoding = config.encoding.unwrap_or(UiTransactionEncoding::Json);
+        let max_supported_transaction_version =
+            config.max_supported_transaction_version;
 
-        // TODO(thlorenz): transactions are retrieved either from the blockstore or bigtable ledger
-        // storage. We have none of those currently, thus return nothing for now
-        // See: rpc/src/rpc.rs :1479
+        // NOTE: Omitting commitment check
 
-        warn!("get_transaction not yet supported");
+        if self.config.enable_rpc_transaction_history {
+            let highest_confirmed_slot = self.bank.slot();
+            let result = self
+                .ledger
+                .get_complete_transaction(signature, highest_confirmed_slot);
+
+            // NOTE: not supporting bigtable
+            if let Some(tx) = result.ok().flatten() {
+                // NOTE: we assume to always have a blocktime
+                let encoded = tx
+                    .encode(encoding, max_supported_transaction_version)
+                    .map_err(RpcCustomError::from)?;
+                return Ok(Some(encoded));
+            }
+        } else {
+            return Err(RpcCustomError::TransactionHistoryNotAvailable.into());
+        }
         Ok(None)
     }
 
@@ -486,9 +562,8 @@ impl JsonRpcRequestProcessor {
             return Err(RpcCustomError::TransactionHistoryNotAvailable.into());
         }
         for signature in signatures {
-            let status = self.get_transaction_status(signature);
-            // NOTE: we have no blockstore nor bigtable ledger storage to query older transactions
-            // from, see: solana/rpc/src/rpc.rs:1436
+            let status = self
+                .get_transaction_status(signature, search_transaction_history);
             statuses.push(status);
         }
 
@@ -498,15 +573,38 @@ impl JsonRpcRequestProcessor {
     fn get_transaction_status(
         &self,
         signature: Signature,
+        search_transaction_history: bool,
     ) -> Option<TransactionStatus> {
-        let (slot, status) = self.bank.get_signature_status_slot(&signature)?;
+        let bank_result = self.bank.get_signature_status_slot(&signature);
+        let (slot, status) = if let Some(bank_result) = bank_result {
+            bank_result
+        } else if self.config.enable_rpc_transaction_history
+            && search_transaction_history
+        {
+            match self
+                .ledger
+                .get_transaction_status(signature, self.bank.slot())
+            {
+                Ok(Some((slot, status))) => (slot, status.status),
+                Err(err) => {
+                    warn!(
+                        "Error loading signature {} from ledger: {:?}",
+                        signature, err
+                    );
+                    return None;
+                }
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
         let err = status.clone().err();
         Some(TransactionStatus {
             slot,
             status,
             err,
             confirmations: None,
-            confirmation_status: None,
+            confirmation_status: Some(TransactionConfirmationStatus::Finalized),
         })
     }
 }

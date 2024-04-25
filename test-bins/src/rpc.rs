@@ -1,7 +1,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     process,
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 
@@ -11,22 +11,27 @@ use sleipnir_bank::{
     bank::Bank,
     genesis_utils::{create_genesis_config, GenesisConfigInfo},
 };
+use sleipnir_ledger::Ledger;
+use sleipnir_perf_service::SamplePerformanceService;
 use sleipnir_pubsub::pubsub_service::{PubsubConfig, PubsubService};
 use sleipnir_rpc::{
     json_rpc_request_processor::JsonRpcConfig, json_rpc_service::JsonRpcService,
 };
 use sleipnir_transaction_status::TransactionStatusSender;
 use solana_sdk::{signature::Keypair, signer::Signer};
+use tempfile::TempDir;
 use test_tools::{
     account::{fund_account, fund_account_addr},
     bank::bank_for_tests_with_paths,
     init_logger,
     programs::load_programs_from_string_config,
 };
+use utils::timestamp_in_secs;
 
 use crate::geyser::{init_geyser_service, GeyserTransactionNotifyListener};
 const LUZIFER: &str = "LuzifKo4E6QCF5r4uQmqbyko7zLS5WgayynivnCbtzk";
 mod geyser;
+mod utils;
 
 fn fund_luzifer(bank: &Bank) {
     // TODO: we need to fund Luzifer at startup instead of doing it here
@@ -46,6 +51,8 @@ async fn main() {
     #[cfg(feature = "tokio-console")]
     console_subscriber::init();
 
+    let exit = Arc::<AtomicBool>::default();
+
     let GenesisConfigInfo {
         genesis_config,
         validator_pubkey,
@@ -59,12 +66,19 @@ async fn main() {
         .get_transaction_notifier()
         .expect("Failed to get transaction notifier from geyser service");
 
+    let ledger_path = TempDir::new().unwrap();
+    let ledger = Arc::new(
+        Ledger::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger"),
+    );
+
     let (transaction_sndr, transaction_recvr) = unbounded();
     let transaction_listener = GeyserTransactionNotifyListener::new(
         transaction_notifier,
         transaction_recvr,
+        ledger.clone(),
     );
-    transaction_listener.run();
+    transaction_listener.run(true);
 
     let bank = {
         let bank = bank_for_tests_with_paths(
@@ -79,6 +93,7 @@ async fn main() {
     fund_luzifer(&bank);
     load_programs_from_env(&bank).unwrap();
 
+    SamplePerformanceService::new(&bank, &ledger, exit);
     let faucet_keypair = fund_faucet(&bank);
 
     let tick_millis = std::env::var("SLOT_MS")
@@ -90,7 +105,7 @@ async fn main() {
         "Adding Slot ticker for {}ms slots",
         tick_duration.as_millis()
     );
-    init_slot_ticker(bank.clone(), tick_duration);
+    init_slot_ticker(bank.clone(), ledger.clone(), tick_duration);
 
     let pubsub_config = PubsubConfig::default();
     // JSON RPC Service
@@ -104,6 +119,7 @@ async fn main() {
             }),
             rpc_socket_addr: Some(rpc_socket_addr),
             pubsub_socket_addr: Some(*pubsub_config.socket()),
+            enable_rpc_transaction_history: true,
 
             ..Default::default()
         };
@@ -115,6 +131,7 @@ async fn main() {
             std::thread::spawn(move || {
                 let _json_rpc_service = JsonRpcService::new(
                     bank,
+                    ledger.clone(),
                     faucet_keypair,
                     genesis_config.hash(),
                     config,
@@ -140,11 +157,20 @@ async fn main() {
     pubsub_service.join().unwrap();
 }
 
-fn init_slot_ticker(bank: Arc<Bank>, tick_duration: Duration) {
+fn init_slot_ticker(
+    bank: Arc<Bank>,
+    ledger: Arc<Ledger>,
+    tick_duration: Duration,
+) {
     let bank = bank.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(tick_duration);
-        bank.advance_slot();
+        let slot = bank.advance_slot();
+        let _ = ledger
+            .cache_block_time(slot, timestamp_in_secs() as i64)
+            .map_err(|e| {
+                error!("Failed to cache block time: {:?}", e);
+            });
     });
 }
 
