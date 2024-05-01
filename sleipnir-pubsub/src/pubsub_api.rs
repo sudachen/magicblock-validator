@@ -10,7 +10,7 @@ use crate::{
     errors::{reject_internal_error, PubsubError, PubsubResult},
     handler::handle_subscription,
     subscription::SubscriptionRequest,
-    types::{AccountParams, SignatureParams},
+    types::{AccountParams, LogsParams, ProgramParams, SignatureParams},
     unsubscribe_tokens::UnsubscribeTokens,
 };
 
@@ -109,6 +109,23 @@ impl PubsubApi {
         Ok(())
     }
 
+    pub fn program_subscribe(
+        &self,
+        subscriber: Subscriber,
+        params: ProgramParams,
+        geyser_service: Arc<GeyserRpcService>,
+    ) -> PubsubResult<()> {
+        self.subscribe
+            .blocking_send(SubscriptionRequest::Program {
+                subscriber,
+                params,
+                geyser_service,
+            })
+            .map_err(map_send_error)?;
+
+        Ok(())
+    }
+
     pub fn slot_subscribe(
         &self,
         subscriber: Subscriber,
@@ -137,6 +154,23 @@ impl PubsubApi {
                 params,
                 geyser_service,
                 bank,
+            })
+            .map_err(map_send_error)?;
+
+        Ok(())
+    }
+
+    pub fn logs_subscribe(
+        &self,
+        subscriber: Subscriber,
+        params: LogsParams,
+        geyser_service: Arc<GeyserRpcService>,
+    ) -> PubsubResult<()> {
+        self.subscribe
+            .blocking_send(SubscriptionRequest::Logs {
+                subscriber,
+                params,
+                geyser_service,
             })
             .map_err(map_send_error)?;
 

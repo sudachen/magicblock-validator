@@ -6,6 +6,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     handler::{
         account_subscribe::handle_account_subscribe,
+        logs_subscribe::handle_logs_subscribe,
+        program_subscribe::handle_program_subscribe,
         signature_subscribe::handle_signature_subscribe,
         slot_subscribe::handle_slot_subscribe,
     },
@@ -13,6 +15,9 @@ use crate::{
 };
 
 mod account_subscribe;
+mod common;
+mod logs_subscribe;
+mod program_subscribe;
 mod signature_subscribe;
 mod slot_subscribe;
 
@@ -44,6 +49,28 @@ pub async fn handle_subscription(
             };
             let elapsed = start.elapsed();
             debug!("accountSubscribe {} lasted for {:?}", subid, elapsed);
+        }
+        Program {
+            subscriber,
+            geyser_service,
+            params,
+        } => {
+            let start = Instant::now();
+            tokio::select! {
+                _ = unsubscriber.cancelled() => {
+                    debug!("ProgramUnsubscribe: {}", subid);
+                },
+                _ = handle_program_subscribe(
+                        subid,
+                        subscriber,
+                        unsubscriber.clone(),
+                        &params,
+                        &geyser_service,
+                    ) => {
+                },
+            };
+            let elapsed = start.elapsed();
+            debug!("programSubscribe {} lasted for {:?}", subid, elapsed);
         }
         Slot {
             subscriber,
@@ -87,6 +114,28 @@ pub async fn handle_subscription(
             };
             let elapsed = start.elapsed();
             debug!("slotSubscribe {} lasted for {:?}", subid, elapsed);
+        }
+        Logs {
+            subscriber,
+            geyser_service,
+            params,
+        } => {
+            let start = Instant::now();
+            tokio::select! {
+                _ = unsubscriber.cancelled() => {
+                    debug!("LogsUnsubscribe: {}", subid);
+                },
+                _ = handle_logs_subscribe(
+                        subid,
+                        subscriber,
+                        unsubscriber.clone(),
+                        &params,
+                        &geyser_service,
+                    ) => {
+                },
+            };
+            let elapsed = start.elapsed();
+            debug!("logsSubscribe {} lasted for {:?}", subid, elapsed);
         }
     }
 }
