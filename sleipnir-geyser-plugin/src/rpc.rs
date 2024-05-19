@@ -28,30 +28,34 @@ use crate::{
     filters::Filter,
     grpc::GrpcService,
     grpc_messages::{BlockMetaStorage, Message},
+    types::{GeyserMessage, GeyserMessages},
     utils::{
         short_signature, short_signature_from_sub_update,
-        short_signature_from_vec,
+        short_signature_from_vec, CacheState,
     },
 };
 
 pub struct GeyserRpcService {
     grpc_service: GrpcService,
     config: ConfigGrpc,
-    broadcast_tx: broadcast::Sender<(CommitmentLevel, Arc<Vec<Message>>)>,
+    broadcast_tx: broadcast::Sender<(CommitmentLevel, GeyserMessages)>,
     subscribe_id: AtomicU64,
 
-    transactions_cache: Cache<Signature, Message>,
-    accounts_cache: Cache<Pubkey, Message>,
+    transactions_cache: Option<Cache<Signature, GeyserMessage>>,
+    accounts_cache: Option<Cache<Pubkey, GeyserMessage>>,
 }
 
 impl std::fmt::Debug for GeyserRpcService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tx_cache = CacheState::from(self.transactions_cache.as_ref());
+        let acc_cache = CacheState::from(self.accounts_cache.as_ref());
         f.debug_struct("GeyserRpcService")
             .field("grpc_service", &self.grpc_service)
             .field("config", &self.config)
             .field("broadcast_tx", &self.broadcast_tx)
             .field("subscribe_id", &self.subscribe_id)
-            .field("transactions_cache_size", &self.transactions_cache.len())
+            .field("transactions_cache", &tx_cache)
+            .field("accounts_cache", &acc_cache)
             .finish()
     }
 }
@@ -61,10 +65,10 @@ impl GeyserRpcService {
     pub fn create(
         config: ConfigGrpc,
         block_fail_action: ConfigBlockFailAction,
-        transactions_cache: Cache<Signature, Message>,
-        accounts_cache: Cache<Pubkey, Message>,
+        transactions_cache: Option<Cache<Signature, GeyserMessage>>,
+        accounts_cache: Option<Cache<Pubkey, GeyserMessage>>,
     ) -> Result<
-        (mpsc::UnboundedSender<Message>, Arc<Notify>, Self),
+        (mpsc::UnboundedSender<GeyserMessage>, Arc<Notify>, Self),
         Box<dyn std::error::Error + Send + Sync>,
     > {
         // Blocks meta storage
@@ -133,11 +137,13 @@ impl GeyserRpcService {
             self.config.normalize_commitment_level,
         )?;
 
-        let msgs = pubkey.and_then(|pubkey| {
-            self.accounts_cache
-                .get(pubkey)
-                .as_ref()
-                .map(|val| Arc::new(vec![val.value().clone()]))
+        let msgs = self.accounts_cache.as_ref().and_then(|cache| {
+            pubkey.and_then(|pubkey| {
+                cache
+                    .get(pubkey)
+                    .as_ref()
+                    .map(|val| Arc::new(vec![val.value().clone()]))
+            })
         });
 
         let sub_update = self.subscribe_impl(filter, subid, unsubscriber, msgs);
@@ -169,19 +175,23 @@ impl GeyserRpcService {
             &self.config.filters,
             self.config.normalize_commitment_level,
         )?;
-        let msgs = signature.and_then(|signature| {
-            let msgs = self
-                .transactions_cache
-                .get(signature)
-                .as_ref()
-                .map(|val| Arc::new(vec![val.value().clone()]));
+        let msgs = self.transactions_cache.as_ref().and_then(|cache| {
+            signature.and_then(|signature| {
+                let msgs = cache
+                    .get(signature)
+                    .as_ref()
+                    .map(|val| Arc::new(vec![val.value().clone()]));
 
-            if log::log_enabled!(log::Level::Trace)
-                && msgs.as_ref().map(|val| val.is_empty()).unwrap_or_default()
-            {
-                trace!("tx cache miss: '{}'", short_signature(signature));
-            }
-            msgs
+                if log::log_enabled!(log::Level::Trace)
+                    && msgs
+                        .as_ref()
+                        .map(|val| val.is_empty())
+                        .unwrap_or_default()
+                {
+                    trace!("tx cache miss: '{}'", short_signature(signature));
+                }
+                msgs
+            })
         });
 
         let sub_update = self.subscribe_impl(filter, subid, unsubscriber, msgs);
@@ -221,7 +231,7 @@ impl GeyserRpcService {
         filter: Filter,
         subid: u64,
         unsubscriber: CancellationToken,
-        initial_messages: Option<Arc<Vec<Message>>>,
+        initial_messages: Option<GeyserMessages>,
     ) -> mpsc::Receiver<Result<SubscribeUpdate, Status>> {
         let (stream_tx, mut stream_rx) =
             mpsc::channel(self.config.channel_capacity);
@@ -247,11 +257,8 @@ impl GeyserRpcService {
         mut filter: Filter,
         stream_tx: mpsc::Sender<TonicResult<SubscribeUpdate>>,
         unsubscriber: CancellationToken,
-        mut messages_rx: broadcast::Receiver<(
-            CommitmentLevel,
-            Arc<Vec<Message>>,
-        )>,
-        mut initial_messages: Option<Arc<Vec<Message>>>,
+        mut messages_rx: broadcast::Receiver<(CommitmentLevel, GeyserMessages)>,
+        mut initial_messages: Option<GeyserMessages>,
     ) {
         // 1. Send initial messages that were cached from previous updates
         if let Some(messages) = initial_messages.take() {
@@ -310,7 +317,7 @@ fn handle_messages(
     unsubscriber: CancellationToken,
     filter: &Filter,
     commitment: CommitmentLevel,
-    messages: Arc<Vec<Message>>,
+    messages: GeyserMessages,
     stream_tx: &mpsc::Sender<TonicResult<SubscribeUpdate>>,
 ) -> bool {
     if commitment == filter.get_commitment_level() {
