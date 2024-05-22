@@ -7,6 +7,7 @@ use std::{
 
 use crossbeam_channel::unbounded;
 use log::*;
+use sleipnir_accounts::{AccountsManager, Cluster};
 use sleipnir_bank::{
     bank::Bank,
     genesis_utils::{create_genesis_config, GenesisConfigInfo},
@@ -18,7 +19,9 @@ use sleipnir_rpc::{
     json_rpc_request_processor::JsonRpcConfig, json_rpc_service::JsonRpcService,
 };
 use sleipnir_transaction_status::TransactionStatusSender;
-use solana_sdk::{signature::Keypair, signer::Signer};
+use solana_sdk::{
+    genesis_config::ClusterType, signature::Keypair, signer::Signer,
+};
 use tempfile::TempDir;
 use test_tools::{
     account::{fund_account, fund_account_addr},
@@ -108,14 +111,15 @@ async fn main() {
     let pubsub_config = PubsubConfig::default();
     // JSON RPC Service
     let json_rpc_service = {
+        let transaction_status_sender = TransactionStatusSender {
+            sender: transaction_sndr,
+        };
         let rpc_socket_addr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8899);
         let config = JsonRpcConfig {
             slot_duration: tick_duration,
             genesis_creation_time: genesis_config.creation_time,
-            transaction_status_sender: Some(TransactionStatusSender {
-                sender: transaction_sndr,
-            }),
+            transaction_status_sender: Some(transaction_status_sender.clone()),
             rpc_socket_addr: Some(rpc_socket_addr),
             pubsub_socket_addr: Some(*pubsub_config.socket()),
             enable_rpc_transaction_history: true,
@@ -127,12 +131,20 @@ async fn main() {
         // other tokio runtimes, i.e. the one of the GeyserPlugin
         let hdl = {
             let bank = bank.clone();
+            let accounts_manager = AccountsManager::try_new(
+                Cluster::Known(ClusterType::Devnet),
+                &bank,
+                Some(transaction_status_sender),
+                Default::default(),
+            )
+            .expect("Failed to create accounts manager");
             std::thread::spawn(move || {
                 let _json_rpc_service = JsonRpcService::new(
                     bank,
                     ledger.clone(),
                     faucet_keypair,
                     genesis_config.hash(),
+                    accounts_manager,
                     config,
                 )
                 .unwrap();

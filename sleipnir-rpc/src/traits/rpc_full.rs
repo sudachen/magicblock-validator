@@ -69,7 +69,7 @@ pub trait Full {
         pubkey_str: String,
         lamports: u64,
         config: Option<RpcRequestAirdropConfig>,
-    ) -> Result<String>;
+    ) -> BoxFuture<Result<String>>;
 
     #[rpc(meta, name = "sendTransaction")]
     fn send_transaction(
@@ -77,7 +77,7 @@ pub trait Full {
         meta: Self::Metadata,
         data: String,
         config: Option<RpcSendTransactionConfig>,
-    ) -> Result<String>;
+    ) -> BoxFuture<Result<String>>;
 
     /* TODO: Not yet supporting transaction simulation
     #[rpc(meta, name = "simulateTransaction")]
