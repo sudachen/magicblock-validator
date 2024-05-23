@@ -7,11 +7,12 @@ use std::{
 
 use crossbeam_channel::unbounded;
 use log::*;
-use sleipnir_accounts::{AccountsManager, Cluster};
+use sleipnir_accounts::AccountsManager;
 use sleipnir_bank::{
     bank::Bank,
     genesis_utils::{create_genesis_config, GenesisConfigInfo},
 };
+use sleipnir_config::{ProgramConfig, SleipnirConfig};
 use sleipnir_ledger::Ledger;
 use sleipnir_perf_service::SamplePerformanceService;
 use sleipnir_pubsub::pubsub_service::{PubsubConfig, PubsubService};
@@ -19,19 +20,20 @@ use sleipnir_rpc::{
     json_rpc_request_processor::JsonRpcConfig, json_rpc_service::JsonRpcService,
 };
 use sleipnir_transaction_status::TransactionStatusSender;
-use solana_sdk::{
-    genesis_config::ClusterType, signature::Keypair, signer::Signer,
-};
+use solana_sdk::{signature::Keypair, signer::Signer};
 use tempfile::TempDir;
 use test_tools::{
     account::{fund_account, fund_account_addr},
     bank::bank_for_tests_with_paths,
     init_logger,
-    programs::load_programs_from_string_config,
+    programs::{load_programs_from_config, load_programs_from_string_config},
 };
 use utils::timestamp_in_secs;
 
-use crate::geyser::{init_geyser_service, GeyserTransactionNotifyListener};
+use crate::{
+    geyser::{init_geyser_service, GeyserTransactionNotifyListener},
+    utils::try_convert_accounts_config,
+};
 const LUZIFER: &str = "LuzifKo4E6QCF5r4uQmqbyko7zLS5WgayynivnCbtzk";
 mod geyser;
 mod utils;
@@ -53,6 +55,12 @@ async fn main() {
 
     #[cfg(feature = "tokio-console")]
     console_subscriber::init();
+    let (file, config) = load_config_from_arg();
+    match file {
+        Some(file) => info!("Loading config from '{}'.", file),
+        None => info!("Using default config. Override it by passing the path to a config file."),
+    };
+    info!("Starting validator with config:\n{}", config);
 
     let exit = Arc::<AtomicBool>::default();
 
@@ -92,15 +100,12 @@ async fn main() {
         Arc::new(bank)
     };
     fund_luzifer(&bank);
-    load_programs_from_env(&bank).unwrap();
+    load_programs(&bank, &config.programs).unwrap();
 
     SamplePerformanceService::new(&bank, &ledger, exit);
     let faucet_keypair = fund_faucet(&bank);
 
-    let tick_millis = std::env::var("SLOT_MS")
-        .map(|s| s.parse::<u64>().expect("SLOT_MS needs to be a number"))
-        .unwrap_or(100);
-
+    let tick_millis = config.validator.millis_per_slot;
     let tick_duration = Duration::from_millis(tick_millis);
     info!(
         "Adding Slot ticker for {}ms slots",
@@ -108,15 +113,17 @@ async fn main() {
     );
     init_slot_ticker(bank.clone(), ledger.clone(), tick_duration);
 
-    let pubsub_config = PubsubConfig::default();
+    let pubsub_config = PubsubConfig::from_rpc(config.rpc.port);
     // JSON RPC Service
     let json_rpc_service = {
         let transaction_status_sender = TransactionStatusSender {
             sender: transaction_sndr,
         };
-        let rpc_socket_addr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8899);
-        let config = JsonRpcConfig {
+        let rpc_socket_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            config.rpc.port,
+        );
+        let rpc_json_config = JsonRpcConfig {
             slot_duration: tick_duration,
             genesis_creation_time: genesis_config.creation_time,
             transaction_status_sender: Some(transaction_status_sender.clone()),
@@ -131,11 +138,11 @@ async fn main() {
         // other tokio runtimes, i.e. the one of the GeyserPlugin
         let hdl = {
             let bank = bank.clone();
+            let accounts_config =  try_convert_accounts_config(&config.accounts).expect("Failed to derive accounts config from provided sleipnir config");
             let accounts_manager = AccountsManager::try_new(
-                Cluster::Known(ClusterType::Devnet),
                 &bank,
                 Some(transaction_status_sender),
-                Default::default(),
+                accounts_config,
             )
             .expect("Failed to create accounts manager");
             std::thread::spawn(move || {
@@ -145,7 +152,7 @@ async fn main() {
                     faucet_keypair,
                     genesis_config.hash(),
                     accounts_manager,
-                    config,
+                    rpc_json_config,
                 )
                 .unwrap();
             })
@@ -185,12 +192,31 @@ fn init_slot_ticker(
     });
 }
 
-fn load_programs_from_env(
+fn load_programs(
     bank: &Bank,
+    programs: &[ProgramConfig],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Keep supporting the old way of loading programs, but phase out eventually
     if let Ok(programs) = std::env::var("PROGRAMS") {
-        Ok(load_programs_from_string_config(bank, &programs)?)
-    } else {
-        Ok(())
+        load_programs_from_string_config(bank, &programs)?;
+    }
+
+    load_programs_from_config(bank, programs)
+}
+
+fn load_config_from_arg() -> (Option<String>, SleipnirConfig) {
+    let config_file = std::env::args().nth(1);
+    match config_file {
+        Some(config_file) => {
+            let config = SleipnirConfig::try_load_from_file(&config_file)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "Failed to load config file from '{}'. ({})",
+                        config_file, err
+                    )
+                });
+            (Some(config_file), config)
+        }
+        None => (None, Default::default()),
     }
 }
