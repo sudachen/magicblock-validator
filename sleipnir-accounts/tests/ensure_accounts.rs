@@ -5,7 +5,7 @@ use sleipnir_accounts::{
     errors::AccountsError, ExternalAccountsManager, ExternalReadonlyMode,
     ExternalWritableMode,
 };
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{native_token::LAMPORTS_PER_SOL, pubkey::Pubkey};
 use test_tools_core::init_logger;
 use utils::stubs::{
     AccountClonerStub, InternalAccountProviderStub,
@@ -32,6 +32,7 @@ fn setup(
         external_readonly_mode: ExternalReadonlyMode::All,
         external_writable_mode: ExternalWritableMode::Delegated,
         create_accounts: false,
+        payer_init_lamports: Some(1_000 * LAMPORTS_PER_SOL),
     }
 }
 
@@ -41,7 +42,8 @@ async fn test_ensure_readonly_account_not_tracked_nor_in_our_validator() {
     let readonly = Pubkey::new_unique();
 
     let internal_account_provider = InternalAccountProviderStub::default();
-    let validated_accounts_provider = ValidatedAccountsProviderStub::valid();
+    let validated_accounts_provider =
+        ValidatedAccountsProviderStub::valid_default();
 
     let manager = setup(
         internal_account_provider,
@@ -52,6 +54,7 @@ async fn test_ensure_readonly_account_not_tracked_nor_in_our_validator() {
     let holder = TransactionAccountsHolder {
         readonly: vec![readonly],
         writable: vec![],
+        payer: Pubkey::new_unique(),
     };
 
     let result = manager
@@ -69,7 +72,8 @@ async fn test_ensure_readonly_account_not_tracked_but_in_our_validator() {
     let readonly = Pubkey::new_unique();
 
     let mut internal_account_provider = InternalAccountProviderStub::default();
-    let validated_accounts_provider = ValidatedAccountsProviderStub::valid();
+    let validated_accounts_provider =
+        ValidatedAccountsProviderStub::valid_default();
 
     internal_account_provider.add(readonly, Default::default());
 
@@ -82,6 +86,7 @@ async fn test_ensure_readonly_account_not_tracked_but_in_our_validator() {
     let holder = TransactionAccountsHolder {
         readonly: vec![readonly],
         writable: vec![],
+        payer: Pubkey::new_unique(),
     };
 
     let result = manager
@@ -99,7 +104,8 @@ async fn test_ensure_readonly_account_tracked_but_not_in_our_validator() {
     let readonly = Pubkey::new_unique();
 
     let internal_account_provider = InternalAccountProviderStub::default();
-    let validated_accounts_provider = ValidatedAccountsProviderStub::valid();
+    let validated_accounts_provider =
+        ValidatedAccountsProviderStub::valid_default();
 
     let manager = setup(
         internal_account_provider,
@@ -112,6 +118,7 @@ async fn test_ensure_readonly_account_tracked_but_not_in_our_validator() {
     let holder = TransactionAccountsHolder {
         readonly: vec![readonly],
         writable: vec![],
+        payer: Pubkey::new_unique(),
     };
 
     let result = manager
@@ -130,7 +137,8 @@ async fn test_ensure_readonly_account_in_our_validator_and_new_writable() {
     let writable = Pubkey::new_unique();
 
     let mut internal_account_provider = InternalAccountProviderStub::default();
-    let validated_accounts_provider = ValidatedAccountsProviderStub::valid();
+    let validated_accounts_provider =
+        ValidatedAccountsProviderStub::valid_default();
 
     internal_account_provider.add(readonly, Default::default());
 
@@ -143,6 +151,7 @@ async fn test_ensure_readonly_account_in_our_validator_and_new_writable() {
     let holder = TransactionAccountsHolder {
         readonly: vec![readonly],
         writable: vec![writable],
+        payer: Pubkey::new_unique(),
     };
 
     let result = manager
@@ -151,8 +160,56 @@ async fn test_ensure_readonly_account_in_our_validator_and_new_writable() {
     assert_eq!(result.unwrap().len(), 1);
     assert!(!manager.account_cloner.did_clone(&readonly));
     assert!(manager.account_cloner.did_clone(&writable));
+    assert!(manager.account_cloner.did_not_override_lamports(&writable));
     assert!(manager.external_readonly_accounts.is_empty());
     assert!(manager.external_writable_accounts.has(&writable));
+}
+
+#[tokio::test]
+async fn test_ensure_locked_with_owner_and_unlocked_writable_payer() {
+    init_logger!();
+    let locked = Pubkey::new_unique();
+    let locked_owner = Pubkey::new_unique();
+    let payer = Pubkey::new_unique();
+
+    let internal_account_provider = InternalAccountProviderStub::default();
+    let payers = vec![payer].into_iter().collect();
+    let with_owners = vec![(locked, locked_owner)].into_iter().collect();
+
+    let validated_accounts_provider =
+        ValidatedAccountsProviderStub::valid(payers, with_owners);
+
+    let manager = setup(
+        internal_account_provider,
+        AccountClonerStub::default(),
+        validated_accounts_provider,
+    );
+
+    let holder = TransactionAccountsHolder {
+        readonly: vec![],
+        writable: vec![payer, locked],
+        payer,
+    };
+
+    let result = manager
+        .ensure_accounts_from_holder(holder, "tx-sig".to_string())
+        .await;
+    assert_eq!(result.unwrap().len(), 2);
+
+    assert!(manager.external_readonly_accounts.is_empty());
+    assert!(manager.external_writable_accounts.has(&payer));
+    assert!(manager.external_writable_accounts.has(&locked));
+
+    assert!(manager.account_cloner.did_clone(&payer));
+    assert!(manager
+        .account_cloner
+        .did_override_lamports(&payer, LAMPORTS_PER_SOL * 1_000));
+    assert!(manager.account_cloner.did_not_override_owner(&payer));
+
+    assert!(manager
+        .account_cloner
+        .did_override_owner(&locked, &locked_owner));
+    assert!(manager.account_cloner.did_not_override_lamports(&locked));
 }
 
 #[tokio::test]
@@ -165,7 +222,8 @@ async fn test_ensure_multiple_accounts_coming_in_over_time() {
     let writable2 = Pubkey::new_unique();
 
     let internal_account_provider = InternalAccountProviderStub::default();
-    let validated_accounts_provider = ValidatedAccountsProviderStub::valid();
+    let validated_accounts_provider =
+        ValidatedAccountsProviderStub::valid_default();
 
     let manager = setup(
         internal_account_provider,
@@ -178,6 +236,7 @@ async fn test_ensure_multiple_accounts_coming_in_over_time() {
         let holder = TransactionAccountsHolder {
             readonly: vec![readonly1, readonly2],
             writable: vec![writable1],
+            payer: Pubkey::new_unique(),
         };
 
         let result = manager
@@ -205,6 +264,7 @@ async fn test_ensure_multiple_accounts_coming_in_over_time() {
         let holder = TransactionAccountsHolder {
             readonly: vec![readonly1, readonly2],
             writable: vec![],
+            payer: Pubkey::new_unique(),
         };
 
         let result = manager
@@ -232,6 +292,7 @@ async fn test_ensure_multiple_accounts_coming_in_over_time() {
         let holder = TransactionAccountsHolder {
             readonly: vec![readonly2, readonly3],
             writable: vec![writable2],
+            payer: Pubkey::new_unique(),
         };
 
         let result = manager
@@ -274,6 +335,7 @@ async fn test_ensure_writable_account_fails_to_validate() {
     let holder = TransactionAccountsHolder {
         readonly: vec![],
         writable: vec![writable],
+        payer: Pubkey::new_unique(),
     };
 
     let result = manager
