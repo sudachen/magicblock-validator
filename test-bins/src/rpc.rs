@@ -32,7 +32,7 @@ use utils::timestamp_in_secs;
 
 use crate::{
     geyser::{init_geyser_service, GeyserTransactionNotifyListener},
-    utils::try_convert_accounts_config,
+    utils::{try_convert_accounts_config, TEST_KEYPAIR_BYTES},
 };
 const LUZIFER: &str = "LuzifKo4E6QCF5r4uQmqbyko7zLS5WgayynivnCbtzk";
 mod geyser;
@@ -64,11 +64,12 @@ async fn main() {
 
     let exit = Arc::<AtomicBool>::default();
 
+    let validator_keypair = validator_keypair();
     let GenesisConfigInfo {
         genesis_config,
         validator_pubkey,
         ..
-    } = create_genesis_config(u64::MAX);
+    } = create_genesis_config(u64::MAX, &validator_keypair.pubkey());
     let (geyser_service, geyser_rpc_service) = init_geyser_service()
         .await
         .expect("Failed to init geyser service");
@@ -134,17 +135,27 @@ async fn main() {
             ..Default::default()
         };
 
-        // This service needs to run on its own thread as otherwise it affects
-        // other tokio runtimes, i.e. the one of the GeyserPlugin
-        let hdl = {
-            let bank = bank.clone();
+        let accounts_manager = {
             let accounts_config =  try_convert_accounts_config(&config.accounts).expect("Failed to derive accounts config from provided sleipnir config");
             let accounts_manager = AccountsManager::try_new(
                 &bank,
                 Some(transaction_status_sender),
+                validator_keypair,
                 accounts_config,
             )
             .expect("Failed to create accounts manager");
+            Arc::new(accounts_manager)
+        };
+
+        init_commit_accounts_ticker(
+            &accounts_manager,
+            Duration::from_millis(config.accounts.commit.frequency_millis),
+        );
+
+        // This service needs to run on its own thread as otherwise it affects
+        // other tokio runtimes, i.e. the one of the GeyserPlugin
+        let hdl = {
+            let bank = bank.clone();
             std::thread::spawn(move || {
                 let _json_rpc_service = JsonRpcService::new(
                     bank,
@@ -171,8 +182,22 @@ async fn main() {
         bank.clone(),
     );
 
+    info!("Validator identity: {}", validator_pubkey);
+
     json_rpc_service.join().unwrap();
     pubsub_service.join().unwrap();
+}
+
+fn validator_keypair() -> Keypair {
+    // 1. Try to load it from an env var base58 encoded
+    if let Ok(keypair) = std::env::var("VALIDATOR_KEYPAIR") {
+        Keypair::from_base58_string(&keypair)
+    } else {
+        warn!("Using default test keypair, provide one by setting 'VALIDATOR_KEYPAIR' env var to a base58 encoded private key");
+        Keypair::from_bytes(&TEST_KEYPAIR_BYTES)
+            // SAFETY: these bytes are compiled into the code, thus we know it is valid
+            .unwrap()
+    }
 }
 
 fn init_slot_ticker(
@@ -189,6 +214,30 @@ fn init_slot_ticker(
             .map_err(|e| {
                 error!("Failed to cache block time: {:?}", e);
             });
+    });
+}
+
+fn init_commit_accounts_ticker(
+    manager: &Arc<AccountsManager>,
+    tick_duration: Duration,
+) {
+    let manager = manager.clone();
+    tokio::task::spawn(async move {
+        loop {
+            tokio::time::sleep(tick_duration).await;
+            let sigs = manager.commit_delegated().await;
+            match sigs {
+                Ok(sigs) if sigs.is_empty() => {
+                    trace!("No accounts committed");
+                }
+                Ok(sigs) => {
+                    debug!("Commits: {:?}", sigs);
+                }
+                Err(err) => {
+                    error!("Failed to commit accounts: {:?}", err);
+                }
+            }
+        }
     });
 }
 

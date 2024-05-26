@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
@@ -9,13 +9,14 @@ use conjunto_transwise::{
     errors::{TranswiseError, TranswiseResult},
     trans_account_meta::TransactionAccountsHolder,
     validated_accounts::{
-        ValidateAccountsConfig, ValidatedAccounts, ValidatedReadonlyAccount,
-        ValidatedWritableAccount,
+        LockConfig, ValidateAccountsConfig, ValidatedAccounts,
+        ValidatedReadonlyAccount, ValidatedWritableAccount,
     },
-    TransactionAccountsExtractor, ValidatedAccountsProvider,
+    CommitFrequency, TransactionAccountsExtractor, ValidatedAccountsProvider,
 };
 use sleipnir_accounts::{
-    errors::AccountsResult, AccountCloner, InternalAccountProvider,
+    errors::AccountsResult, AccountCloner, AccountCommitter,
+    InternalAccountProvider,
 };
 use sleipnir_mutator::AccountModification;
 use solana_sdk::{
@@ -52,6 +53,7 @@ pub struct AccountClonerStub {
     cloned_accounts: RwLock<HashMap<Pubkey, Option<AccountModification>>>,
 }
 
+#[allow(unused)] // used in tests
 impl AccountClonerStub {
     pub fn did_clone(&self, pubkey: &Pubkey) -> bool {
         self.cloned_accounts.read().unwrap().contains_key(pubkey)
@@ -125,6 +127,39 @@ impl AccountCloner for AccountClonerStub {
 }
 
 // -----------------
+// AccountCommitter
+// -----------------
+#[derive(Debug, Default, Clone)]
+pub struct AccountCommitterStub {
+    committed_accounts: Arc<RwLock<HashMap<Pubkey, AccountSharedData>>>,
+}
+
+#[allow(unused)] // used in tests
+impl AccountCommitterStub {
+    pub fn len(&self) -> usize {
+        self.committed_accounts.read().unwrap().len()
+    }
+    pub fn committed(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        self.committed_accounts.read().unwrap().get(pubkey).cloned()
+    }
+}
+
+#[async_trait]
+impl AccountCommitter for AccountCommitterStub {
+    async fn commit_account(
+        &self,
+        delegated_account: Pubkey,
+        committed_state_data: AccountSharedData,
+    ) -> AccountsResult<Option<Signature>> {
+        self.committed_accounts
+            .write()
+            .unwrap()
+            .insert(delegated_account, committed_state_data);
+        Ok(Some(Signature::new_unique()))
+    }
+}
+
+// -----------------
 // ValidatedAccountsProviderStub
 // -----------------
 #[derive(Debug, Default)]
@@ -134,6 +169,7 @@ pub struct ValidatedAccountsProviderStub {
     with_owners: HashMap<Pubkey, Pubkey>,
 }
 
+#[allow(unused)] // used in tests
 impl ValidatedAccountsProviderStub {
     pub fn valid_default() -> Self {
         Self {
@@ -222,7 +258,12 @@ impl ValidatedAccountsProvider for ValidatedAccountsProviderStub {
                     .iter()
                     .map(|x| ValidatedWritableAccount {
                         pubkey: *x,
-                        owner: self.with_owners.get(x).cloned(),
+                        lock_config: self.with_owners.get(x).as_ref().map(
+                            |owner| LockConfig {
+                                owner: **owner,
+                                commit_frequency: CommitFrequency::default(),
+                            },
+                        ),
                         is_payer: self.payers.contains(x),
                     })
                     .collect(),

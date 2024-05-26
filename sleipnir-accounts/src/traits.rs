@@ -18,3 +18,16 @@ pub trait AccountCloner {
         overrides: Option<AccountModification>,
     ) -> AccountsResult<Signature>;
 }
+
+#[async_trait]
+pub trait AccountCommitter {
+    /// Commits the account unless it determines that it isn't necessary, i.e. when the
+    /// previously committed state is the same as the [commit_state_data].
+    /// Returns the signature of the commit transaction if it was committed,
+    /// otherwise [None].
+    async fn commit_account(
+        &self,
+        delegated_account: Pubkey,
+        commit_state_data: AccountSharedData,
+    ) -> AccountsResult<Option<Signature>>;
+}

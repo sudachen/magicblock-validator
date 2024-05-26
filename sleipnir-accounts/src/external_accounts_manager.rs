@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use conjunto_transwise::{
     trans_account_meta::TransactionAccountsHolder,
@@ -9,7 +9,13 @@ use log::*;
 use sleipnir_bank::bank::Bank;
 use sleipnir_mutator::AccountModification;
 use sleipnir_transaction_status::TransactionStatusSender;
-use solana_sdk::{signature::Signature, transaction::SanitizedTransaction};
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::{
+    commitment_config::CommitmentConfig,
+    pubkey::Pubkey,
+    signature::{Keypair, Signature},
+    transaction::SanitizedTransaction,
+};
 
 use crate::{
     bank_account_provider::BankAccountProvider,
@@ -17,25 +23,29 @@ use crate::{
     errors::AccountsResult,
     external_accounts::{ExternalReadonlyAccounts, ExternalWritableAccounts},
     remote_account_cloner::RemoteAccountCloner,
-    traits::{AccountCloner, InternalAccountProvider},
-    utils::try_rpc_cluster_from_cluster,
+    remote_account_committer::RemoteAccountCommitter,
+    traits::{AccountCloner, AccountCommitter, InternalAccountProvider},
+    utils::{get_epoch, try_rpc_cluster_from_cluster},
 };
 
 pub type AccountsManager = ExternalAccountsManager<
     BankAccountProvider,
     RemoteAccountCloner,
+    RemoteAccountCommitter,
     Transwise,
 >;
 
 #[derive(Debug)]
-pub struct ExternalAccountsManager<IAP, AC, VAP>
+pub struct ExternalAccountsManager<IAP, ACL, ACM, VAP>
 where
     IAP: InternalAccountProvider,
-    AC: AccountCloner,
+    ACL: AccountCloner,
+    ACM: AccountCommitter,
     VAP: ValidatedAccountsProvider + TransactionAccountsExtractor,
 {
     pub internal_account_provider: IAP,
-    pub account_cloner: AC,
+    pub account_cloner: ACL,
+    pub account_committer: ACM,
     pub validated_accounts_provider: VAP,
     pub external_readonly_accounts: ExternalReadonlyAccounts,
     pub external_writable_accounts: ExternalWritableAccounts,
@@ -46,17 +56,27 @@ where
 }
 
 impl
-    ExternalAccountsManager<BankAccountProvider, RemoteAccountCloner, Transwise>
+    ExternalAccountsManager<
+        BankAccountProvider,
+        RemoteAccountCloner,
+        RemoteAccountCommitter,
+        Transwise,
+    >
 {
     pub fn try_new(
         bank: &Arc<Bank>,
         transaction_status_sender: Option<TransactionStatusSender>,
+        committer_authority: Keypair,
         config: AccountsConfig,
     ) -> AccountsResult<Self> {
         let external_config = config.external;
         let cluster = external_config.cluster;
         let internal_account_provider = BankAccountProvider::new(bank.clone());
         let rpc_cluster = try_rpc_cluster_from_cluster(&cluster)?;
+        let rpc_client = RpcClient::new_with_commitment(
+            rpc_cluster.url().to_string(),
+            CommitmentConfig::confirmed(),
+        );
         let rpc_provider_config = RpcProviderConfig::new(rpc_cluster, None);
 
         let account_cloner = RemoteAccountCloner::new(
@@ -64,11 +84,14 @@ impl
             bank.clone(),
             transaction_status_sender,
         );
+        let account_committer =
+            RemoteAccountCommitter::new(rpc_client, committer_authority);
         let validated_accounts_provider = Transwise::new(rpc_provider_config);
 
         Ok(Self {
             internal_account_provider,
             account_cloner,
+            account_committer,
             validated_accounts_provider,
             external_readonly_accounts: ExternalReadonlyAccounts::default(),
             external_writable_accounts: ExternalWritableAccounts::default(),
@@ -80,10 +103,11 @@ impl
     }
 }
 
-impl<IAP, AC, VAP> ExternalAccountsManager<IAP, AC, VAP>
+impl<IAP, ACL, ACM, VAP> ExternalAccountsManager<IAP, ACL, ACM, VAP>
 where
     IAP: InternalAccountProvider,
-    AC: AccountCloner,
+    ACL: AccountCloner,
+    ACM: AccountCommitter,
     VAP: ValidatedAccountsProvider + TransactionAccountsExtractor,
 {
     pub async fn ensure_accounts(
@@ -209,8 +233,12 @@ where
                             "{}{}{}",
                             if x.is_payer { "[payer]:" } else { "" },
                             x.pubkey,
-                            x.owner
-                                .map(|x| format!(" owner: {}", x))
+                            x.lock_config
+                                .as_ref()
+                                .map(|x| format!(
+                                    ", owner: {}, commit_frequency: {}",
+                                    x.owner, x.commit_frequency
+                                ))
                                 .unwrap_or("".to_string()),
                         )
                     })
@@ -230,10 +258,11 @@ where
         }
 
         for writable in validated_accounts.writable {
-            let mut overrides = writable.owner.map(|x| AccountModification {
-                owner: Some(x.to_string()),
-                ..Default::default()
-            });
+            let mut overrides =
+                writable.lock_config.as_ref().map(|x| AccountModification {
+                    owner: Some(x.owner.to_string()),
+                    ..Default::default()
+                });
             if writable.is_payer {
                 if let Some(lamports) = self.payer_init_lamports {
                     match overrides {
@@ -252,7 +281,10 @@ where
                 .clone_account(&writable.pubkey, overrides)
                 .await?;
             signatures.push(signature);
-            self.external_writable_accounts.insert(writable.pubkey);
+            self.external_writable_accounts.insert(
+                writable.pubkey,
+                writable.lock_config.as_ref().map(|x| x.commit_frequency),
+            );
         }
 
         if log::log_enabled!(log::Level::Debug) && !signatures.is_empty() {
@@ -260,5 +292,70 @@ where
         }
 
         Ok(signatures)
+    }
+
+    /// This will look at the time that passed since the last commit and determine
+    /// which accounts are due to be committed, perform that step for them
+    /// and return the signatures of the transactions that were sent to the cluster.
+    pub async fn commit_delegated(&self) -> AccountsResult<Vec<Signature>> {
+        let now = get_epoch();
+
+        // 1. Find all accounts that are due to be committed
+        let accounts_to_be_committed = self
+            .external_writable_accounts
+            .read_accounts()
+            .values()
+            .filter(|x| x.needs_commit(now))
+            .map(|x| x.pubkey)
+            .collect::<Vec<_>>();
+
+        // 2. Get current account states from internal account provider
+        let mut account_states = HashMap::new();
+        for pubkey in &accounts_to_be_committed {
+            let account_state =
+                self.internal_account_provider.get_account(pubkey);
+            if let Some(acc) = account_state {
+                account_states.insert(*pubkey, acc);
+            } else {
+                error!(
+                    "Cannot find state for account that needs to be committed '{}' ",
+                    pubkey
+                );
+            }
+        }
+
+        // 3. Commit the accounts and mark them as committed
+        let mut signatures = Vec::new();
+        for (pubkey, state) in account_states {
+            let sig =
+                self.account_committer.commit_account(pubkey, state).await?;
+            // If the last committed state is the same as the current state
+            // then it wasn't committed.
+            // In that case we don't mark it as such in order to trigger commitment
+            // as soon as its state changes.
+            if let Some(sig) = sig {
+                signatures.push(sig);
+                if let Some(acc) =
+                    self.external_writable_accounts.read_accounts().get(&pubkey)
+                {
+                    acc.mark_as_committed(now);
+                } else {
+                    // This should never happen
+                    error!(
+                        "Account '{}' disappeared while being committed",
+                        pubkey
+                    );
+                }
+            }
+        }
+
+        Ok(signatures)
+    }
+
+    pub fn last_commit(&self, pubkey: &Pubkey) -> Option<Duration> {
+        self.external_writable_accounts
+            .read_accounts()
+            .get(pubkey)
+            .map(|x| x.last_committed_at())
     }
 }
