@@ -7,6 +7,8 @@ use solana_sdk::{
     hash::Hash,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    signature::Keypair,
+    signer::Signer,
     transaction::Transaction,
 };
 use thiserror::Error;
@@ -68,18 +70,30 @@ pub(crate) enum SleipnirInstruction {
     /// Modify one or more accounts
     ///
     /// # Account references
-    ///  0.    `[WRITE, SIGNER]` Sleipnir Modify Authority
+    ///  0.    `[WRITE, SIGNER]` Validator Authority
     ///  1..n. `[WRITE]` Accounts to modify
     ///  n+1.  `[SIGNER]` (Implicit NativeLoader)
     ModifyAccounts(HashMap<Pubkey, AccountModificationForInstruction>),
+
+    /// Forces the provided account to be committed to chain regardless
+    /// of the commit frequency of the validator or the delegated account
+    /// itself
+    ///
+    /// # Account references
+    /// 0. `[WRITE, SIGNER]` Payer requesting the account to be committed
+    /// 1. `[]`              Account to commit
+    TriggerCommit,
 }
 
+// -----------------
+// ModifyAccounts
+// -----------------
 pub fn modify_accounts(
     keyed_account_mods: Vec<(Pubkey, AccountModification)>,
     recent_blockhash: Hash,
 ) -> Transaction {
     let ix = modify_accounts_instruction(keyed_account_mods);
-    into_transaction(ix, recent_blockhash)
+    into_transaction(&validator_authority(), ix, recent_blockhash)
 }
 
 pub(crate) fn modify_accounts_instruction(
@@ -108,14 +122,44 @@ pub(crate) fn modify_accounts_instruction(
     )
 }
 
+// -----------------
+// TriggerCommit
+// -----------------
+pub fn trigger_commit(
+    payer: &Keypair,
+    account_to_commit: Pubkey,
+    recent_blockhash: Hash,
+) -> Transaction {
+    let ix = trigger_commit_instruction(payer, account_to_commit);
+    into_transaction(payer, ix, recent_blockhash)
+}
+
+pub(crate) fn trigger_commit_instruction(
+    payer: &Keypair,
+    account_to_commit: Pubkey,
+) -> Instruction {
+    Instruction::new_with_bincode(
+        crate::id(),
+        &SleipnirInstruction::TriggerCommit,
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(account_to_commit, false),
+        ],
+    )
+}
+
+// -----------------
+// Utils
+// -----------------
 fn into_transaction(
+    signer: &Keypair,
     instruction: Instruction,
     recent_blockhash: Hash,
 ) -> Transaction {
-    let signers = &[&validator_authority()];
+    let signers = &[&signer];
     Transaction::new_signed_with_payer(
         &[instruction],
-        Some(&validator_authority_id()),
+        Some(&signer.pubkey()),
         signers,
         recent_blockhash,
     )

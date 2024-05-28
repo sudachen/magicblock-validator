@@ -20,6 +20,8 @@ use solana_sdk::{
 };
 
 use crate::{
+    commit_sender::send_commit,
+    errors::MagicError,
     sleipnir_instruction::{
         AccountModificationForInstruction, SleipnirError, SleipnirInstruction,
     },
@@ -47,10 +49,16 @@ declare_process_instruction!(
                     &mut account_mods,
                 )
             }
+            SleipnirInstruction::TriggerCommit => {
+                trigger_commit(invoke_context, transaction_context)
+            }
         }
     }
 );
 
+// -----------------
+// MutateAccounts
+// -----------------
 lazy_static! {
     /// In order to modify large data chunks we cannot include all the data as part of the
     /// transaction.
@@ -90,14 +98,14 @@ fn mutate_accounts(
     let account_mods_len = account_mods.len() as u64;
 
     // 1. Checks
-    let sleipnir_authority_acc = {
+    let validator_authority_acc = {
         // 1.1. Sleipnir authority must sign
-        let sleipnir_authority = validator_authority_id();
-        if !signers.contains(&sleipnir_authority) {
+        let validator_authority = validator_authority_id();
+        if !signers.contains(&validator_authority) {
             ic_msg!(
                 invoke_context,
                 "Validator identity '{}' not in signers",
-                &sleipnir_authority.to_string()
+                &validator_authority.to_string()
             );
             return Err(InstructionError::MissingRequiredSignature);
         }
@@ -125,7 +133,7 @@ fn mutate_accounts(
         // 1.4. Check that first account is the Sleipnir authority
         let sleipnir_authority_key =
             transaction_context.get_key_of_account_at_index(0)?;
-        if sleipnir_authority_key != &sleipnir_authority {
+        if sleipnir_authority_key != &validator_authority {
             ic_msg!(
                 invoke_context,
                 "MutateAccounts: first account must be the Sleipnir authority"
@@ -203,7 +211,7 @@ fn mutate_accounts(
     }
 
     if lamports_to_debit != 0 {
-        let authority_lamports = sleipnir_authority_acc.borrow().lamports();
+        let authority_lamports = validator_authority_acc.borrow().lamports();
         let adjusted_authority_lamports = if lamports_to_debit > 0 {
             (authority_lamports as u128)
                 .checked_sub(lamports_to_debit as u128)
@@ -230,7 +238,7 @@ fn mutate_accounts(
                 })?
         };
 
-        sleipnir_authority_acc.borrow_mut().set_lamports(
+        validator_authority_acc.borrow_mut().set_lamports(
             u64::try_from(adjusted_authority_lamports).map_err(|err| {
                 ic_msg!(
                     invoke_context,
@@ -245,28 +253,140 @@ fn mutate_accounts(
     Ok(())
 }
 
-/* TODO: Figure out how to mock_process_instruction and enable these tests
+// -----------------
+// TriggerCommit
+// -----------------
+fn trigger_commit(
+    invoke_context: &InvokeContext,
+    transaction_context: &TransactionContext,
+) -> Result<(), InstructionError> {
+    // Payer is the first account and the program and committee accounts come after
+    let pubkey = {
+        if transaction_context.get_number_of_accounts() < 3 {
+            ic_msg!(
+                invoke_context,
+                "TriggerCommit ERR: not enough accounts to trigger commit, need payer and account to commit"
+            );
+            return Err(InstructionError::NotEnoughAccountKeys);
+        }
+        if transaction_context.get_number_of_accounts() > 3 {
+            ic_msg!(
+                invoke_context,
+                "TriggerCommit ERR: too many accounts to trigger commit, need payer and account to commit only"
+            );
+            return Err(MagicError::TooManyAccountsProvided.into());
+        }
+        let program_idx = transaction_context
+            .find_index_of_program_account(&crate::id())
+            .ok_or_else(|| {
+                ic_msg!(
+                    invoke_context,
+                    "TriggerCommit ERR: Magic program account not found"
+                );
+                InstructionError::UnsupportedProgramId
+            })?;
+        // SAFETY: we ensured above that there are exactly 3 accounts and the first account
+        // is always the payer, so the program account is either the second or third account
+        let committee_idx = match program_idx {
+            0 => {
+                ic_msg!(
+                    invoke_context,
+                    "TriggerCommit ERR: program key found in payer position"
+                );
+                return Err(MagicError::ProgramCannotBePayer.into());
+            }
+            1 => 2,
+            2 => 1,
+            _ => unreachable!("We verified exactly three accounts"),
+        };
+        transaction_context.get_key_of_account_at_index(committee_idx)?
+    };
+
+    ic_msg!(invoke_context, "TriggerCommit: account '{}'", pubkey);
+    send_commit(*pubkey)
+        // Handle error related to sending the request
+        .map_err(|err| {
+            ic_msg!(
+                invoke_context,
+                "TriggerCommit: failed to send commit pubkey: {}.\nError: {}",
+                pubkey,
+                err
+            );
+            InstructionError::from(err.error)
+        })?
+        .blocking_recv()
+        // Handle error related to receiving request confirmation
+        .map_err(|err| {
+            ic_msg!(
+                invoke_context,
+                "TriggerCommit: failed to receive commit pubkey response: {} ({:?})",
+                pubkey,
+                err
+            );
+            InstructionError::from(MagicError::InternalError)
+        })?
+        // Handle error related to processing the request
+        .map_err(|err| {
+            ic_msg!(
+                invoke_context,
+                "TriggerCommit: failed to process commit pubkey: {}.\nError: {}",
+                pubkey,
+                err
+            );
+            InstructionError::from(err.error)
+        })?;
+
+    Ok(())
+}
+
+// mock_process_instruction
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
     use std::collections::HashMap;
 
     use crate::{
-        sleipnir_authority,
-        sleipnir_instruction::{modify_accounts_instruction, AccountModification},
+        commit_sender::init_commit_channel,
+        errors::MagicErrorWithContext,
+        has_validator_authority, set_validator_authority,
+        sleipnir_instruction::{
+            modify_accounts_instruction, trigger_commit_instruction,
+            AccountModification,
+        },
     };
 
     use super::*;
-    use solana_program::{
-        instruction::{AccountMeta, InstructionError},
-        pubkey::Pubkey,
-        sleipnir_program,
-    };
     use solana_program_runtime::invoke_context::mock_process_instruction;
     use solana_sdk::{
         account::{Account, AccountSharedData},
+        signature::{Keypair, Signature},
         signer::Signer,
     };
+    use solana_sdk::{
+        instruction::{AccountMeta, InstructionError},
+        pubkey::Pubkey,
+    };
+
+    const AUTHORITY_BALANCE: u64 = u64::MAX / 2;
+
+    pub fn ensure_funded_validator_authority(
+        map: &mut HashMap<Pubkey, AccountSharedData>,
+    ) {
+        if !has_validator_authority() {
+            let validator_authority = Keypair::new();
+            let validator_id = validator_authority.pubkey();
+            set_validator_authority(validator_authority);
+
+            map.insert(
+                validator_id,
+                AccountSharedData::new(
+                    AUTHORITY_BALANCE,
+                    0,
+                    &system_program::id(),
+                ),
+            );
+        }
+    }
 
     fn process_instruction(
         instruction_data: &[u8],
@@ -275,7 +395,7 @@ mod tests {
         expected_result: Result<(), InstructionError>,
     ) -> Vec<AccountSharedData> {
         mock_process_instruction(
-            &sleipnir_program::id(),
+            &crate::id(),
             Vec::new(),
             instruction_data,
             transaction_accounts,
@@ -287,21 +407,20 @@ mod tests {
         )
     }
 
+    // -----------------
+    // ModifyAccounts
+    // -----------------
     #[test]
     fn test_mod_all_fields_of_one_account() {
         let owner_key = Pubkey::from([9; 32]);
         let mod_key = Pubkey::new_unique();
-        let authority_balance = u64::MAX / 2;
         let mut account_data = {
             let mut map = HashMap::new();
             map.insert(mod_key, AccountSharedData::new(100, 0, &mod_key));
-            // NOTE: this needs to be added at genesis
-            map.insert(
-                sleipnir_authority().pubkey(),
-                AccountSharedData::new(authority_balance, 0, &system_program::id()),
-            );
             map
         };
+        ensure_funded_validator_authority(&mut account_data);
+
         let modification = AccountModification {
             lamports: Some(200),
             owner: Some(owner_key),
@@ -309,7 +428,8 @@ mod tests {
             data: Some(vec![1, 2, 3, 4, 5]),
             rent_epoch: Some(88),
         };
-        let ix = modify_accounts_instruction(vec![(mod_key, modification.clone())]);
+        let ix =
+            modify_accounts_instruction(vec![(mod_key, modification.clone())]);
         let transaction_accounts = ix
             .accounts
             .iter()
@@ -329,7 +449,8 @@ mod tests {
 
         assert_eq!(accounts.len(), 2);
 
-        let account_authority: Account = accounts.drain(0..1).next().unwrap().into();
+        let account_authority: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             account_authority,
             Account {
@@ -339,12 +460,13 @@ mod tests {
                 data,
                 rent_epoch: 0,
             } => {
-                assert_eq!(lamports, authority_balance - 100);
+                assert_eq!(lamports, AUTHORITY_BALANCE - 100);
                 assert_eq!(owner, system_program::id());
                 assert!(data.is_empty());
             }
         );
-        let modified_account: Account = accounts.drain(0..1).next().unwrap().into();
+        let modified_account: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             modified_account,
             Account {
@@ -364,18 +486,14 @@ mod tests {
     fn test_mod_lamports_of_two_accounts() {
         let mod_key1 = Pubkey::new_unique();
         let mod_key2 = Pubkey::new_unique();
-        let authority_balance = u64::MAX / 2;
         let mut account_data = {
             let mut map = HashMap::new();
             map.insert(mod_key1, AccountSharedData::new(100, 0, &mod_key1));
             map.insert(mod_key2, AccountSharedData::new(200, 0, &mod_key2));
-            // NOTE: this needs to be added at genesis
-            map.insert(
-                sleipnir_authority().pubkey(),
-                AccountSharedData::new(authority_balance, 0, &system_program::id()),
-            );
             map
         };
+        ensure_funded_validator_authority(&mut account_data);
+
         let ix = modify_accounts_instruction(vec![
             (
                 mod_key1,
@@ -411,7 +529,8 @@ mod tests {
 
         assert_eq!(accounts.len(), 3);
 
-        let account_authority: Account = accounts.drain(0..1).next().unwrap().into();
+        let account_authority: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             account_authority,
             Account {
@@ -421,12 +540,13 @@ mod tests {
                 data,
                 rent_epoch: 0,
             } => {
-                assert_eq!(lamports, authority_balance - 400);
+                assert_eq!(lamports, AUTHORITY_BALANCE - 400);
                 assert_eq!(owner, system_program::id());
                 assert!(data.is_empty());
             }
         );
-        let modified_account1: Account = accounts.drain(0..1).next().unwrap().into();
+        let modified_account1: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             modified_account1,
             Account {
@@ -439,7 +559,8 @@ mod tests {
                 assert!(data.is_empty());
             }
         );
-        let modified_account2: Account = accounts.drain(0..1).next().unwrap().into();
+        let modified_account2: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             modified_account2,
             Account {
@@ -462,20 +583,16 @@ mod tests {
         let mod_key4 = Pubkey::new_unique();
         let mod_2_owner = Pubkey::from([9; 32]);
 
-        let authority_balance = u64::MAX / 2;
         let mut account_data = {
             let mut map = HashMap::new();
             map.insert(mod_key1, AccountSharedData::new(100, 0, &mod_key1));
             map.insert(mod_key2, AccountSharedData::new(200, 0, &mod_key2));
             map.insert(mod_key3, AccountSharedData::new(300, 0, &mod_key3));
             map.insert(mod_key4, AccountSharedData::new(400, 0, &mod_key4));
-            // NOTE: this needs to be added at genesis
-            map.insert(
-                sleipnir_authority().pubkey(),
-                AccountSharedData::new(authority_balance, 0, &system_program::id()),
-            );
             map
         };
+        ensure_funded_validator_authority(&mut account_data);
+
         let ix = modify_accounts_instruction(vec![
             (
                 mod_key1,
@@ -529,7 +646,8 @@ mod tests {
             Ok(()),
         );
 
-        let account_authority: Account = accounts.drain(0..1).next().unwrap().into();
+        let account_authority: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             account_authority,
             Account {
@@ -539,13 +657,14 @@ mod tests {
                 data,
                 rent_epoch: 0,
             } => {
-                assert_eq!(lamports, authority_balance - 3300);
+                assert_eq!(lamports, AUTHORITY_BALANCE - 3300);
                 assert_eq!(owner, system_program::id());
                 assert!(data.is_empty());
             }
         );
 
-        let modified_account1: Account = accounts.drain(0..1).next().unwrap().into();
+        let modified_account1: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             modified_account1,
             Account {
@@ -559,7 +678,8 @@ mod tests {
             }
         );
 
-        let modified_account2: Account = accounts.drain(0..1).next().unwrap().into();
+        let modified_account2: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             modified_account2,
             Account {
@@ -574,7 +694,8 @@ mod tests {
             }
         );
 
-        let modified_account3: Account = accounts.drain(0..1).next().unwrap().into();
+        let modified_account3: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             modified_account3,
             Account {
@@ -588,7 +709,8 @@ mod tests {
             }
         );
 
-        let modified_account4: Account = accounts.drain(0..1).next().unwrap().into();
+        let modified_account4: Account =
+            accounts.drain(0..1).next().unwrap().into();
         assert_matches!(
             modified_account4,
             Account {
@@ -602,5 +724,112 @@ mod tests {
             }
         );
     }
+
+    // -----------------
+    // TriggerCommit
+    // -----------------
+    fn setup_commit_handler(delegated_key: Pubkey) {
+        let mut rx = init_commit_channel(5);
+
+        tokio::task::spawn(async move {
+            let (pubkey, cb) = rx.recv().await.unwrap();
+            if pubkey == delegated_key {
+                cb.send(Ok(Signature::default()))
+            } else {
+                cb.send(Err(MagicErrorWithContext::new(
+                    MagicError::AccountNotDelegated,
+                    format!("Account: '{}'", pubkey),
+                )))
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn test_trigger_commit_for_delegated_account() {
+        let payer = Keypair::new();
+        let delegated_key = Pubkey::new_unique();
+        let mut account_data = {
+            let mut map = HashMap::new();
+            map.insert(
+                payer.pubkey(),
+                AccountSharedData::new(100, 0, &payer.pubkey()),
+            );
+            map.insert(
+                delegated_key,
+                AccountSharedData::new(100, 0, &delegated_key),
+            );
+            map
+        };
+        setup_commit_handler(delegated_key);
+
+        let ix = trigger_commit_instruction(&payer, delegated_key);
+
+        let transaction_accounts = ix
+            .accounts
+            .iter()
+            .flat_map(|acc| {
+                account_data
+                    .remove(&acc.pubkey)
+                    .map(|shared_data| (acc.pubkey, shared_data))
+            })
+            .collect();
+
+        tokio::task::spawn_blocking(move || {
+            process_instruction(
+                ix.data.as_slice(),
+                transaction_accounts,
+                ix.accounts,
+                Ok(()),
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_trigger_commit_for_undelegated_account() {
+        let payer = Keypair::new();
+        let delegated_key = Pubkey::new_unique();
+        let undelegated_key = Pubkey::new_unique();
+        let mut account_data = {
+            let mut map = HashMap::new();
+            map.insert(
+                payer.pubkey(),
+                AccountSharedData::new(100, 0, &payer.pubkey()),
+            );
+            map.insert(
+                delegated_key,
+                AccountSharedData::new(100, 0, &delegated_key),
+            );
+            map.insert(
+                undelegated_key,
+                AccountSharedData::new(100, 0, &undelegated_key),
+            );
+            map
+        };
+        setup_commit_handler(delegated_key);
+
+        let ix = trigger_commit_instruction(&payer, undelegated_key);
+
+        let transaction_accounts = ix
+            .accounts
+            .iter()
+            .flat_map(|acc| {
+                account_data
+                    .remove(&acc.pubkey)
+                    .map(|shared_data| (acc.pubkey, shared_data))
+            })
+            .collect();
+
+        tokio::task::spawn_blocking(move || {
+            process_instruction(
+                ix.data.as_slice(),
+                transaction_accounts,
+                ix.accounts,
+                Err(InstructionError::from(MagicError::AccountNotDelegated)),
+            );
+        })
+        .await
+        .unwrap();
+    }
 }
-*/
