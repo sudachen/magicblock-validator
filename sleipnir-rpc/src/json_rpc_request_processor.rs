@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -10,7 +11,9 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use jsonrpc_core::{Error, ErrorCode, Metadata, Result, Value};
 use log::*;
 use sleipnir_accounts::AccountsManager;
-use sleipnir_bank::bank::Bank;
+use sleipnir_bank::{
+    bank::Bank, transaction_simulation::TransactionSimulationResult,
+};
 use sleipnir_ledger::{Ledger, SignatureInfosForAddress};
 use sleipnir_transaction_status::TransactionStatusSender;
 use solana_account_decoder::{UiAccount, UiAccountEncoding};
@@ -18,14 +21,15 @@ use solana_accounts_db::accounts_index::AccountSecondaryIndexes;
 use solana_rpc_client_api::{
     config::{
         RpcAccountInfoConfig, RpcContextConfig, RpcEncodingConfigWrapper,
-        RpcSignatureStatusConfig, RpcSupplyConfig, RpcTransactionConfig,
+        RpcSignatureStatusConfig, RpcSimulateTransactionAccountsConfig,
+        RpcSupplyConfig, RpcTransactionConfig,
     },
     custom_error::RpcCustomError,
     filter::RpcFilterType,
     response::{
         OptionalContext, Response as RpcResponse, RpcBlockhash,
         RpcConfirmedTransactionStatusWithSignature, RpcContactInfo,
-        RpcKeyedAccount, RpcSupply,
+        RpcKeyedAccount, RpcSimulateTransactionResult, RpcSupply,
     },
 };
 use solana_sdk::{
@@ -34,18 +38,25 @@ use solana_sdk::{
     hash::Hash,
     pubkey::Pubkey,
     signature::{Keypair, Signature},
+    transaction::{
+        SanitizedTransaction, TransactionError, VersionedTransaction,
+    },
 };
 use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, TransactionConfirmationStatus,
-    TransactionStatus, UiTransactionEncoding,
+    map_inner_instructions, EncodedConfirmedTransactionWithStatusMeta,
+    TransactionConfirmationStatus, TransactionStatus, UiInnerInstructions,
+    UiTransactionEncoding,
 };
 
 use crate::{
     account_resolver::{encode_account, get_encoded_account},
     filters::{get_filtered_program_accounts, optimize_filters},
-    rpc_health::RpcHealth,
-    transaction::airdrop_transaction,
-    utils::new_response,
+    rpc_health::{RpcHealth, RpcHealthStatus},
+    transaction::{
+        airdrop_transaction, ensure_accounts, sanitize_transaction,
+        sig_verify_transaction_and_check_precompiles,
+    },
+    utils::{new_response, verify_pubkey},
     RpcCustomResult,
 };
 
@@ -77,6 +88,9 @@ pub struct JsonRpcConfig {
     pub transaction_status_sender: Option<TransactionStatusSender>,
     pub rpc_socket_addr: Option<SocketAddr>,
     pub pubsub_socket_addr: Option<SocketAddr>,
+
+    /// Configures if to verify transaction signatures
+    pub disable_sigverify: bool,
 }
 
 // NOTE: from rpc/src/rpc.rs :193
@@ -526,7 +540,13 @@ impl JsonRpcRequestProcessor {
             message: format!("Invalid pubkey: {}", e),
             data: None,
         })?;
-        airdrop_transaction(self, pubkey, lamports).await
+        airdrop_transaction(
+            self,
+            pubkey,
+            lamports,
+            !self.config.disable_sigverify,
+        )
+        .await
     }
 
     pub async fn get_transaction(
@@ -567,6 +587,197 @@ impl JsonRpcRequestProcessor {
         &self,
     ) -> Option<&TransactionStatusSender> {
         self.config.transaction_status_sender.as_ref()
+    }
+
+    pub fn transaction_preflight(
+        &self,
+        preflight_bank: &Bank,
+        transaction: &SanitizedTransaction,
+    ) -> Result<()> {
+        match self.health.check() {
+            RpcHealthStatus::Ok => (),
+            RpcHealthStatus::Unknown => {
+                inc_new_counter_info!("rpc-send-tx_health-unknown", 1);
+                return Err(RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
+                }
+                .into());
+            }
+        }
+
+        if let TransactionSimulationResult {
+            result: Err(err),
+            logs,
+            post_simulation_accounts: _,
+            units_consumed,
+            return_data,
+            inner_instructions: _, // Always `None` due to `enable_cpi_recording = false`
+        } = preflight_bank.simulate_transaction_unchecked(transaction, false)
+        {
+            match err {
+                TransactionError::BlockhashNotFound => {
+                    inc_new_counter_info!(
+                        "rpc-send-tx_err-blockhash-not-found",
+                        1
+                    );
+                }
+                _ => {
+                    inc_new_counter_info!("rpc-send-tx_err-other", 1);
+                }
+            }
+            return Err(RpcCustomError::SendTransactionPreflightFailure {
+                message: format!("Transaction simulation failed: {err}"),
+                result: RpcSimulateTransactionResult {
+                    err: Some(err),
+                    logs: Some(logs),
+                    accounts: None,
+                    units_consumed: Some(units_consumed),
+                    return_data: return_data
+                        .map(|return_data| return_data.into()),
+                    inner_instructions: None,
+                },
+            }
+            .into());
+        }
+
+        Ok(())
+    }
+
+    pub async fn simulate_transaction(
+        &self,
+        mut unsanitized_tx: VersionedTransaction,
+        config_accounts: Option<RpcSimulateTransactionAccountsConfig>,
+        replace_recent_blockhash: bool,
+        sig_verify: bool,
+        enable_cpi_recording: bool,
+    ) -> Result<RpcResponse<RpcSimulateTransactionResult>> {
+        let bank = self.get_bank();
+
+        if replace_recent_blockhash {
+            if sig_verify {
+                return Err(Error::invalid_params(
+                    "sigVerify may not be used with replaceRecentBlockhash",
+                ));
+            }
+            unsanitized_tx
+                .message
+                .set_recent_blockhash(bank.last_blockhash());
+        }
+        let sanitized_transaction =
+            sanitize_transaction(unsanitized_tx, &*bank)?;
+        if sig_verify {
+            sig_verify_transaction_and_check_precompiles(
+                &sanitized_transaction,
+                &bank.feature_set,
+            )?;
+        }
+
+        if let Err(err) =
+            ensure_accounts(&self.accounts_manager, &sanitized_transaction)
+                .await
+        {
+            const MAGIC_ID: &str =
+                "Magic11111111111111111111111111111111111111";
+            let logs = vec![
+                format!("{MAGIC_ID}: An error was encountered before simulating the transaction."),
+                format!("{MAGIC_ID}: Something went wrong when trying to clone the needed accounts into the validator."),
+                format!("{MAGIC_ID}: Error: {err:?}"),
+            ];
+            return Ok(new_response(
+                &bank,
+                RpcSimulateTransactionResult {
+                    err: Some(TransactionError::AccountNotFound),
+                    logs: Some(logs),
+                    accounts: None,
+                    units_consumed: Some(0),
+                    return_data: None,
+                    inner_instructions: None,
+                },
+            ));
+        }
+
+        let TransactionSimulationResult {
+            result,
+            logs,
+            post_simulation_accounts,
+            units_consumed,
+            return_data,
+            inner_instructions,
+        } = bank.simulate_transaction_unchecked(
+            &sanitized_transaction,
+            enable_cpi_recording,
+        );
+
+        let account_keys = sanitized_transaction.message().account_keys();
+        let number_of_accounts = account_keys.len();
+
+        let accounts = if let Some(config_accounts) = config_accounts {
+            let accounts_encoding = config_accounts
+                .encoding
+                .unwrap_or(UiAccountEncoding::Base64);
+
+            if accounts_encoding == UiAccountEncoding::Binary
+                || accounts_encoding == UiAccountEncoding::Base58
+            {
+                return Err(Error::invalid_params(
+                    "base58 encoding not supported",
+                ));
+            }
+
+            if config_accounts.addresses.len() > number_of_accounts {
+                return Err(Error::invalid_params(format!(
+                    "Too many accounts provided; max {number_of_accounts}"
+                )));
+            }
+
+            if result.is_err() {
+                Some(vec![None; config_accounts.addresses.len()])
+            } else {
+                let mut post_simulation_accounts_map = HashMap::new();
+                for (pubkey, data) in post_simulation_accounts {
+                    post_simulation_accounts_map.insert(pubkey, data);
+                }
+
+                Some(
+                    config_accounts
+                        .addresses
+                        .iter()
+                        .map(|address_str| {
+                            let pubkey = verify_pubkey(address_str)?;
+                            get_encoded_account(
+                                &bank,
+                                &pubkey,
+                                accounts_encoding,
+                                None,
+                                Some(&post_simulation_accounts_map),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            }
+        } else {
+            None
+        };
+
+        let inner_instructions = inner_instructions.map(|info| {
+            map_inner_instructions(info)
+                .map(|converted| {
+                    UiInnerInstructions::parse(converted, &account_keys)
+                })
+                .collect()
+        });
+
+        Ok(new_response(
+            &bank,
+            RpcSimulateTransactionResult {
+                err: result.err(),
+                logs: Some(logs),
+                accounts,
+                units_consumed: Some(units_consumed),
+                return_data: return_data.map(|return_data| return_data.into()),
+                inner_instructions,
+            },
+        ))
     }
 
     pub fn get_cluster_nodes(&self) -> Vec<RpcContactInfo> {

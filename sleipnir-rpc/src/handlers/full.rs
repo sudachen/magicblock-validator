@@ -8,6 +8,7 @@ use solana_rpc_client_api::{
         RpcBlocksConfigWrapper, RpcContextConfig, RpcEncodingConfigWrapper,
         RpcEpochConfig, RpcRequestAirdropConfig, RpcSendTransactionConfig,
         RpcSignatureStatusConfig, RpcSignaturesForAddressConfig,
+        RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig,
         RpcTransactionConfig,
     },
     request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
@@ -15,6 +16,7 @@ use solana_rpc_client_api::{
         Response as RpcResponse, RpcBlockhash,
         RpcConfirmedTransactionStatusWithSignature, RpcContactInfo,
         RpcInflationReward, RpcPerfSample, RpcPrioritizationFee,
+        RpcSimulateTransactionResult,
     },
 };
 use solana_sdk::{
@@ -36,9 +38,12 @@ use crate::{
     traits::rpc_full::Full,
     transaction::{
         decode_and_deserialize, sanitize_transaction, send_transaction,
+        SendTransactionConfig,
+    },
+    utils::{
+        new_response, verify_and_parse_signatures_for_address_params,
         verify_signature,
     },
-    utils::{new_response, verify_and_parse_signatures_for_address_params},
 };
 
 const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
@@ -167,6 +172,7 @@ impl Full for FullImpl {
                 &meta,
                 data,
                 preflight_commitment,
+                skip_preflight,
                 min_context_slot,
                 tx_encoding,
                 max_retries,
@@ -175,6 +181,36 @@ impl Full for FullImpl {
         })
     }
 
+    fn simulate_transaction(
+        &self,
+        meta: Self::Metadata,
+        data: String,
+        config: Option<RpcSimulateTransactionConfig>,
+    ) -> BoxFuture<Result<RpcResponse<RpcSimulateTransactionResult>>> {
+        let RpcSimulateTransactionConfig {
+            sig_verify,
+            replace_recent_blockhash,
+            commitment,
+            encoding,
+            accounts: config_accounts,
+            min_context_slot,
+            inner_instructions: enable_cpi_recording,
+        } = config.unwrap_or_default();
+        let tx_encoding = encoding.unwrap_or(UiTransactionEncoding::Base58);
+
+        Box::pin(async move {
+            simulate_transaction_impl(
+                &meta,
+                data,
+                tx_encoding,
+                config_accounts,
+                replace_recent_blockhash,
+                sig_verify,
+                enable_cpi_recording,
+            )
+            .await
+        })
+    }
     fn minimum_ledger_slot(&self, meta: Self::Metadata) -> Result<Slot> {
         todo!("minimum_ledger_slot")
     }
@@ -340,6 +376,7 @@ async fn send_transaction_impl(
     meta: &JsonRpcRequestProcessor,
     data: String,
     preflight_commitment: Option<CommitmentConfig>,
+    skip_preflight: bool,
     min_context_slot: Option<Slot>,
     tx_encoding: UiTransactionEncoding,
     max_retries: Option<usize>,
@@ -378,15 +415,50 @@ async fn send_transaction_impl(
             preflight_bank.block_height() + MAX_RECENT_BLOCKHASHES as u64;
     }
 
-    // TODO(thlorenz): leaving out if !skip_preflight part
-
+    let preflight_bank = if skip_preflight {
+        None
+    } else {
+        Some(preflight_bank)
+    };
     send_transaction(
         meta,
+        preflight_bank,
         signature,
         transaction,
-        last_valid_block_height,
-        durable_nonce_info,
-        max_retries,
+        SendTransactionConfig {
+            sigverify: !meta.config.disable_sigverify,
+            last_valid_block_height,
+            durable_nonce_info,
+            max_retries,
+        },
+    )
+    .await
+}
+
+async fn simulate_transaction_impl(
+    meta: &JsonRpcRequestProcessor,
+    data: String,
+    tx_encoding: UiTransactionEncoding,
+    config_accounts: Option<RpcSimulateTransactionAccountsConfig>,
+    replace_recent_blockhash: bool,
+    sig_verify: bool,
+    enable_cpi_recording: bool,
+) -> Result<RpcResponse<RpcSimulateTransactionResult>> {
+    let binary_encoding = tx_encoding.into_binary_encoding().ok_or_else(|| {
+        Error::invalid_params(format!(
+            "unsupported encoding: {tx_encoding}. Supported encodings: base58, base64"
+        ))
+    })?;
+
+    let (_, unsanitized_tx) =
+        decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
+
+    meta.simulate_transaction(
+        unsanitized_tx,
+        config_accounts,
+        replace_recent_blockhash,
+        sig_verify,
+        enable_cpi_recording,
     )
     .await
 }

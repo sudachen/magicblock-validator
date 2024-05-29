@@ -7,12 +7,13 @@ use solana_rpc_client_api::{
         RpcBlocksConfigWrapper, RpcContextConfig, RpcEncodingConfigWrapper,
         RpcEpochConfig, RpcRequestAirdropConfig, RpcSendTransactionConfig,
         RpcSignatureStatusConfig, RpcSignaturesForAddressConfig,
-        RpcTransactionConfig,
+        RpcSimulateTransactionConfig, RpcTransactionConfig,
     },
     response::{
         Response as RpcResponse, RpcBlockhash,
         RpcConfirmedTransactionStatusWithSignature, RpcContactInfo,
         RpcInflationReward, RpcPerfSample, RpcPrioritizationFee,
+        RpcSimulateTransactionResult,
     },
 };
 use solana_sdk::{
@@ -71,6 +72,14 @@ pub trait Full {
         config: Option<RpcRequestAirdropConfig>,
     ) -> BoxFuture<Result<String>>;
 
+    #[rpc(meta, name = "simulateTransaction")]
+    fn simulate_transaction(
+        &self,
+        meta: Self::Metadata,
+        data: String,
+        config: Option<RpcSimulateTransactionConfig>,
+    ) -> BoxFuture<Result<RpcResponse<RpcSimulateTransactionResult>>>;
+
     #[rpc(meta, name = "sendTransaction")]
     fn send_transaction(
         &self,
@@ -78,16 +87,6 @@ pub trait Full {
         data: String,
         config: Option<RpcSendTransactionConfig>,
     ) -> BoxFuture<Result<String>>;
-
-    /* TODO: Not yet supporting transaction simulation
-    #[rpc(meta, name = "simulateTransaction")]
-    fn simulate_transaction(
-        &self,
-        meta: Self::Metadata,
-        data: String,
-        config: Option<RpcSimulateTransactionConfig>,
-    ) -> Result<RpcResponse<RpcSimulateTransactionResult>>;
-    */
 
     #[rpc(meta, name = "minimumLedgerSlot")]
     fn minimum_ledger_slot(&self, meta: Self::Metadata) -> Result<Slot>;
