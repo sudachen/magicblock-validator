@@ -106,8 +106,8 @@ impl ExternalReadonlyAccounts {
             .insert(pubkey, ExternalReadonlyAccount::new(pubkey, now));
     }
 
-    pub fn remove(&self, pubkey: Pubkey) {
-        self.write_accounts().remove(&pubkey);
+    pub fn remove(&self, pubkey: &Pubkey) {
+        self.write_accounts().remove(pubkey);
     }
 }
 

@@ -20,7 +20,7 @@ use sleipnir_accounts::{
 };
 use sleipnir_mutator::AccountModification;
 use solana_sdk::{
-    account::AccountSharedData,
+    account::{Account, AccountSharedData},
     pubkey::Pubkey,
     signature::Signature,
     transaction::{SanitizedTransaction, VersionedTransaction},
@@ -119,6 +119,7 @@ impl AccountCloner for AccountClonerStub {
     async fn clone_account(
         &self,
         pubkey: &Pubkey,
+        _account: Option<Account>,
         overrides: Option<AccountModification>,
     ) -> AccountsResult<Signature> {
         self.cloned_accounts
@@ -246,7 +247,7 @@ impl ValidatedAccountsProvider for ValidatedAccountsProviderStub {
                     .iter()
                     .map(|x| ValidatedReadonlyAccount {
                         pubkey: *x,
-                        is_program: Some(false),
+                        account: Some(Account::default()),
                     })
                     .collect(),
                 writable: transaction_accounts
@@ -254,6 +255,16 @@ impl ValidatedAccountsProvider for ValidatedAccountsProviderStub {
                     .iter()
                     .map(|x| ValidatedWritableAccount {
                         pubkey: *x,
+                        account: match self.new_accounts.contains(x) {
+                            true => None,
+                            false => Some(Account {
+                                owner: match self.with_owners.get(x) {
+                                    Some(owner) => *owner,
+                                    None => Pubkey::new_unique(),
+                                },
+                                ..Account::default()
+                            }),
+                        },
                         lock_config: self.with_owners.get(x).as_ref().map(
                             |owner| LockConfig {
                                 owner: **owner,
@@ -261,7 +272,6 @@ impl ValidatedAccountsProvider for ValidatedAccountsProviderStub {
                             },
                         ),
                         is_payer: self.payers.contains(x),
-                        is_new: self.new_accounts.contains(x),
                     })
                     .collect(),
             }),
