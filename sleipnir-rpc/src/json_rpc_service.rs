@@ -1,9 +1,9 @@
 use std::{
-    sync::Arc,
+    net::SocketAddr,
+    sync::{atomic::AtomicBool, Arc, RwLock},
     thread::{self, JoinHandle},
 };
 
-use crossbeam_channel::unbounded;
 use jsonrpc_core::MetaIoHandler;
 use jsonrpc_http_server::{
     hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation,
@@ -16,6 +16,7 @@ use sleipnir_bank::bank::Bank;
 use sleipnir_ledger::Ledger;
 use solana_perf::thread::renice_this_thread;
 use solana_sdk::{hash::Hash, signature::Keypair};
+use tokio::runtime::Runtime;
 
 use crate::{
     handlers::{
@@ -35,13 +36,18 @@ use crate::{
 };
 
 pub struct JsonRpcService {
-    thread_hdl: JoinHandle<()>,
-    close_handle: Option<CloseHandle>,
+    rpc_addr: SocketAddr,
+    rpc_niceness_adj: i8,
+    runtime: Arc<Runtime>,
+    request_processor: JsonRpcRequestProcessor,
+    startup_verification_complete: Arc<AtomicBool>,
+    max_request_body_size: usize,
+    rpc_thread_handle: RwLock<Option<JoinHandle<()>>>,
+    close_handle: Arc<RwLock<Option<CloseHandle>>>,
 }
 
 impl JsonRpcService {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn try_init(
         bank: Arc<Bank>,
         ledger: Arc<Ledger>,
         faucet_keypair: Keypair,
@@ -62,7 +68,7 @@ impl JsonRpcService {
 
         let startup_verification_complete =
             Arc::clone(bank.get_startup_verification_complete());
-        let health = Arc::new(RpcHealth::new(startup_verification_complete));
+        let health = RpcHealth::new(startup_verification_complete.clone());
 
         let request_processor = JsonRpcRequestProcessor::new(
             bank,
@@ -74,8 +80,33 @@ impl JsonRpcService {
             config,
         );
 
-        let (close_handle_sender, close_handle_receiver) = unbounded();
-        let thread_hdl = thread::Builder::new()
+        Ok(Self {
+            rpc_addr,
+            rpc_niceness_adj,
+            max_request_body_size,
+            runtime,
+            request_processor,
+            startup_verification_complete,
+            rpc_thread_handle: Default::default(),
+            close_handle: Default::default(),
+        })
+    }
+
+    pub fn start(&self) -> Result<(), String> {
+        if self.close_handle.read().unwrap().is_some() {
+            return Err("JSON RPC service already running".to_string());
+        }
+
+        let rpc_niceness_adj = self.rpc_niceness_adj;
+        let startup_verification_complete =
+            self.startup_verification_complete.clone();
+        let request_processor = self.request_processor.clone();
+        let rpc_addr = self.rpc_addr;
+        let runtime = self.runtime.handle().clone();
+        let max_request_body_size = self.max_request_body_size;
+
+        let close_handle_rc = self.close_handle.clone();
+        let thread_handle = thread::Builder::new()
             .name("solJsonRpcSvc".to_string())
             .spawn(move || {
                 renice_this_thread(rpc_niceness_adj).unwrap();
@@ -89,15 +120,16 @@ impl JsonRpcService {
                 io.extend_with(MinimalImpl.to_delegate());
                 io.extend_with(DeprecatedImpl.to_delegate());
 
-                let request_middleware = RpcRequestMiddleware::new(health.clone());
+                let health = RpcHealth::new(startup_verification_complete);
+                let request_middleware = RpcRequestMiddleware::new(health);
 
                 let server = ServerBuilder::with_meta_extractor(
                     io,
                     move |_req: &hyper::Request<hyper::Body>| {
-                        request_processor.clone()
+                       request_processor.clone()
                     },
                 )
-                .event_loop_executor(runtime.handle().clone())
+                .event_loop_executor(runtime)
                 .threads(1)
                 .cors(DomainsValidation::AllowOnly(vec![
                     AccessControlAllowOrigin::Any,
@@ -107,42 +139,54 @@ impl JsonRpcService {
                 .max_request_body_size(max_request_body_size)
                 .start_http(&rpc_addr);
 
+
                 match server {
                     Err(e) => {
-                        warn!(
+                        error!(
                             "JSON RPC service unavailable error: {:?}. \n\
                             Also, check that port {} is not already in use by another application",
                             e,
                             rpc_addr.port()
                         );
-                        close_handle_sender.send(Err(e.to_string())).unwrap();
                     }
                     Ok(server) => {
+                        let close_handle = server.close_handle().clone();
+                        close_handle_rc
+                            .write()
+                            .unwrap()
+                            .replace(close_handle);
                         server.wait();
                     }
                 }
             })
             .unwrap();
 
-        let close_handle = close_handle_receiver.recv().unwrap()?;
+        self.rpc_thread_handle
+            .write()
+            .unwrap()
+            .replace(thread_handle);
 
-        // NOTE: left out registering close_handle.close with validator_exit :558
-
-        Ok(Self {
-            thread_hdl,
-            close_handle: Some(close_handle),
-        })
+        Ok(())
     }
 
-    pub fn exit(&mut self) {
-        if let Some(c) = self.close_handle.take() {
-            c.close()
+    pub fn close(&self) {
+        if let Some(close_handle) = self.close_handle.write().unwrap().take() {
+            close_handle.close();
         }
     }
 
-    pub fn join(mut self) -> thread::Result<()> {
-        self.exit();
-        self.thread_hdl.join()
+    pub fn join(&self) -> Result<(), String> {
+        self.rpc_thread_handle
+            .write()
+            .unwrap()
+            .take()
+            .map(|x| x.join())
+            .unwrap_or(Ok(()))
+            .map_err(|err| format!("{:?}", err))
+    }
+
+    pub fn rpc_addr(&self) -> &SocketAddr {
+        &self.rpc_addr
     }
 }
 

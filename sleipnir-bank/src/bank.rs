@@ -658,10 +658,19 @@ impl Bank {
         self.rc.accounts.set_slot(next_slot);
 
         // 2. Update transaction processor with new slot
-        self.transaction_processor
-            .write()
-            .unwrap()
-            .set_slot(next_slot);
+        // We used to just set the slot here, but wanted to avoid having a local
+        // slightly modified copy of the solana-svm.
+        *self.transaction_processor.write().unwrap() =
+            TransactionBatchProcessor::new(
+                next_slot,
+                self.epoch,
+                // Potentially expensive clone
+                self.epoch_schedule.clone(),
+                // Potentially expensive clone
+                self.fee_structure.clone(),
+                self.runtime_config.clone(),
+                self.loaded_programs_cache.clone(),
+            );
 
         // 3. Add a "root" to the status cache to trigger removing old items
         self.status_cache
@@ -848,6 +857,14 @@ impl Bank {
         account: &T,
     ) {
         self.store_accounts((self.slot(), &[(pubkey, account)][..]))
+    }
+
+    /// Returns all the accounts this bank can load
+    pub fn get_all_accounts(
+        &self,
+        sorted: bool,
+    ) -> Vec<(Pubkey, AccountSharedData)> {
+        self.rc.accounts.load_all(sorted)
     }
 
     pub fn store_accounts<'a, T: ReadableAccount + Sync + ZeroLamport + 'a>(

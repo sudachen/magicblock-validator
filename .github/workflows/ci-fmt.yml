@@ -12,12 +12,19 @@ jobs:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: magicblock-labs/magicblock-validator@vbrunet/2024_06_10-avoid-double-clone
+      - name: Checkout this magicblock-validator
+        uses: actions/checkout@v2
+        with:
+          path: magicblock-validator
+
+      - uses: ./magicblock-validator/.github/actions/setup-build-env
         with:
           build_cache_key_name: 'magicblock-validator-ci-fmt-v001'
           rust_toolchain_release: nightly
           github_access_token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           conjunto_ref: master
+
       - run: make ci-fmt
         shell: bash
         working-directory: magicblock-validator
