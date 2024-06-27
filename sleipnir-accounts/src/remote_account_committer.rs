@@ -3,9 +3,13 @@ use std::{collections::HashMap, sync::RwLock};
 use async_trait::async_trait;
 use dlp::instruction::{commit_state, finalize};
 use log::*;
-use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_rpc_client::{
+    nonblocking::rpc_client::RpcClient, rpc_client::SerializableTransaction,
+};
+use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_sdk::{
     account::{AccountSharedData, ReadableAccount},
+    commitment_config::CommitmentConfig,
     compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
     pubkey::Pubkey,
@@ -46,11 +50,11 @@ impl RemoteAccountCommitter {
 
 #[async_trait]
 impl AccountCommitter for RemoteAccountCommitter {
-    async fn commit_account(
+    async fn create_commit_account_transaction(
         &self,
         delegated_account: Pubkey,
         commit_state_data: AccountSharedData,
-    ) -> AccountsResult<Option<Signature>> {
+    ) -> AccountsResult<Option<Transaction>> {
         if let Some(committed_account) = self
             .commits
             .read()
@@ -71,6 +75,9 @@ impl AccountCommitter for RemoteAccountCommitter {
             commit_state_data.data().to_vec(),
         );
         let finalize_ix = finalize(committer, delegated_account, committer);
+        // NOTE: this is an async request that the transaction thread waits for to
+        // be completed. It's not ideal, but the only way to create the transaction
+        // and obtain its signature to be logged for the trigger commit.
         let latest_blockhash = self
             .rpc_client
             .get_latest_blockhash()
@@ -90,20 +97,57 @@ impl AccountCommitter for RemoteAccountCommitter {
             &[&self.committer_authority],
             latest_blockhash,
         );
+        Ok(Some(tx))
+    }
 
+    async fn commit_account(
+        &self,
+        delegated_account: Pubkey,
+        commit_state_data: AccountSharedData,
+        transaction: Transaction,
+    ) -> AccountsResult<Signature> {
+        let tx_sig = transaction.get_signature();
         debug!(
-            "Sending commit transaction for account {}",
-            delegated_account
+            "Committing account '{}' sig: {:?} to {}",
+            delegated_account,
+            tx_sig,
+            self.rpc_client.url()
         );
         let signature = self
             .rpc_client
-            .send_and_confirm_transaction(&tx)
+            .send_transaction_with_config(
+                &transaction,
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(|err| {
-                AccountsError::FailedToSendAndConfirmTransaction(
-                    err.to_string(),
-                )
+                AccountsError::FailedToSendTransaction(err.to_string())
             })?;
+
+        if &signature != tx_sig {
+            error!(
+                "Transaction Signature mismatch: {:?} != {:?}",
+                signature, tx_sig
+            );
+        }
+        debug!(
+            "Sent commit for '{}' | signature: '{:?}'",
+            delegated_account, signature
+        );
+
+        self.rpc_client
+            .confirm_transaction_with_commitment(
+                &signature,
+                CommitmentConfig::confirmed(),
+            )
+            .await
+            .map_err(|err| {
+                AccountsError::FailedToConfirmTransaction(err.to_string())
+            })?;
+
         debug!(
             "Confirmed commit for '{}' | signature: '{:?}'",
             delegated_account, signature
@@ -114,7 +158,7 @@ impl AccountCommitter for RemoteAccountCommitter {
             .expect("RwLock commits poisoned")
             .insert(delegated_account, commit_state_data);
 
-        Ok(Some(signature))
+        Ok(signature)
     }
 }
 
