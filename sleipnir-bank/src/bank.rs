@@ -45,7 +45,8 @@ use solana_sdk::{
         ReadableAccount, WritableAccount,
     },
     clock::{
-        BankId, Epoch, Slot, SlotIndex, UnixTimestamp, MAX_PROCESSING_AGE,
+        BankId, Epoch, Slot, SlotIndex, UnixTimestamp, DEFAULT_MS_PER_SLOT,
+        MAX_PROCESSING_AGE, MAX_RECENT_BLOCKHASHES,
         MAX_TRANSACTION_FORWARDING_DELAY,
     },
     epoch_info::EpochInfo,
@@ -258,6 +259,9 @@ pub struct Bank {
     /// Milliseconds per slot which is provided directly when the bank is created
     pub millis_per_slot: u64,
 
+    // The number of block/slot for which generated transactions can stay valid
+    pub max_age: u64,
+
     // -----------------
     // For TransactionProcessingCallback
     // -----------------
@@ -448,6 +452,12 @@ impl Bank {
             Arc::new(RwLock::new(loaded_programs))
         };
 
+        // Transaction expiration needs to be a fixed amount of time
+        // So we compute how many slot it takes for a transaction to expire
+        // Depending on how fast each slot is compute
+        let max_age = DEFAULT_MS_PER_SLOT * MAX_RECENT_BLOCKHASHES as u64
+            / millis_per_slot;
+
         let mut bank = Self {
             rc: BankRc::new(accounts),
             slot: AtomicU64::default(),
@@ -466,10 +476,9 @@ impl Bank {
             fee_structure: FeeStructure::default(),
             loaded_programs_cache,
             transaction_processor: Default::default(),
-            status_cache: Arc::new(RwLock::new(BankStatusCache::new(
-                millis_per_slot,
-            ))),
+            status_cache: Arc::new(RwLock::new(BankStatusCache::new(max_age))),
             millis_per_slot,
+            max_age,
             identity_id: Pubkey::default(),
 
             // Counters
@@ -494,7 +503,7 @@ impl Bank {
             slots_per_year: f64::default(),
 
             // For TransactionProcessingCallback
-            blockhash_queue: RwLock::<BlockhashQueue>::default(),
+            blockhash_queue: RwLock::new(BlockhashQueue::new(max_age)),
             feature_set: Arc::<FeatureSet>::default(),
             rent_collector: RentCollector::default(),
 
@@ -796,7 +805,7 @@ impl Bank {
         blockhash_queue.get_hash_age(blockhash).map(|age| {
             // Since we don't produce blocks ATM, we consider the current slot
             // to be our block height
-            self.block_height() + blockhash_queue.get_max_age() as u64 - age
+            self.block_height() + blockhash_queue.get_max_age() - age
         })
     }
 
@@ -1239,7 +1248,7 @@ impl Bank {
         max_age: u64,
     ) -> bool {
         let blockhash_queue = self.blockhash_queue.read().unwrap();
-        blockhash_queue.is_hash_valid_for_age(hash, max_age as usize)
+        blockhash_queue.is_hash_valid_for_age(hash, max_age)
     }
 
     // -----------------

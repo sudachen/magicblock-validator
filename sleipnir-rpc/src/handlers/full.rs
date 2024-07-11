@@ -20,7 +20,7 @@ use solana_rpc_client_api::{
     },
 };
 use solana_sdk::{
-    clock::{Slot, UnixTimestamp, MAX_RECENT_BLOCKHASHES},
+    clock::{Slot, UnixTimestamp},
     commitment_config::CommitmentConfig,
     hash::Hash,
     message::{SanitizedMessage, SanitizedVersionedMessage, VersionedMessage},
@@ -412,7 +412,7 @@ async fn send_transaction_impl(
         // malicious packing of the retry queue. Durable-nonce transactions are otherwise
         // retried until the nonce is advanced.
         last_valid_block_height =
-            preflight_bank.block_height() + MAX_RECENT_BLOCKHASHES as u64;
+            preflight_bank.block_height() + preflight_bank.max_age;
     }
 
     let preflight_bank = if skip_preflight {
