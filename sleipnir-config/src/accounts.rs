@@ -8,41 +8,23 @@ use url::Url;
 // -----------------
 // AccountsConfig
 // -----------------
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AccountsConfig {
     #[serde(default)]
     pub remote: RemoteConfig,
     #[serde(default)]
-    pub clone: CloneStrategy,
+    pub lifecycle: LifecycleMode,
     #[serde(default)]
     pub commit: CommitStrategy,
-    #[serde(default = "default_create")]
-    pub create: bool,
     #[serde(default)]
     pub payer: Payer,
-}
-
-fn default_create() -> bool {
-    true
-}
-
-impl Default for AccountsConfig {
-    fn default() -> Self {
-        Self {
-            remote: Default::default(),
-            clone: Default::default(),
-            payer: Default::default(),
-            create: true,
-            commit: Default::default(),
-        }
-    }
 }
 
 // -----------------
 // RemoteConfig
 // -----------------
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "kebab-case")]
 pub enum RemoteConfig {
     #[default]
     Devnet,
@@ -81,39 +63,20 @@ where
 }
 
 // -----------------
-// CloneStrategy
+// LifecycleMode
 // -----------------
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct CloneStrategy {
-    #[serde(default)]
-    pub readonly: ReadonlyMode,
-    #[serde(default)]
-    pub writable: WritableMode,
-}
-
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, EnumString,
 )]
-#[serde(rename_all = "camelCase")]
-#[strum(serialize_all = "camelCase")]
-pub enum ReadonlyMode {
-    All,
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum LifecycleMode {
+    Replica,
     #[default]
-    #[serde(alias = "program")]
-    Programs,
-    None,
-}
-
-#[derive(
-    Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, EnumString,
-)]
-#[serde(rename_all = "camelCase")]
-#[strum(serialize_all = "camelCase")]
-pub enum WritableMode {
-    All,
-    Delegated,
-    #[default]
-    None,
+    ProgramsReplica,
+    Ephemeral,
+    EphemeralLimited,
+    Offline,
 }
 
 // -----------------

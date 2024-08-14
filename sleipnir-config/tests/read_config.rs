@@ -5,9 +5,8 @@ use std::{
 };
 
 use sleipnir_config::{
-    AccountsConfig, CloneStrategy, CommitStrategy, GeyserGrpcConfig,
-    ProgramConfig, ReadonlyMode, RemoteConfig, RpcConfig, SleipnirConfig,
-    ValidatorConfig, WritableMode,
+    AccountsConfig, CommitStrategy, GeyserGrpcConfig, LifecycleMode,
+    ProgramConfig, RemoteConfig, RpcConfig, SleipnirConfig, ValidatorConfig,
 };
 use solana_sdk::pubkey::Pubkey;
 use test_tools_core::paths::cargo_workspace_dir;
@@ -75,11 +74,9 @@ fn test_load_local_dev_with_programs_toml_envs_override() {
 
     // Set the ENV variables
     env::set_var("ACCOUNTS_REMOTE", base_cluster);
-    env::set_var("ACCOUNTS_CLONE_READONLY", "all");
-    env::set_var("ACCOUNTS_CLONE_WRITABLE", "delegated");
+    env::set_var("ACCOUNTS_LIFECYCLE", "ephemeral-limited");
     env::set_var("ACCOUNTS_COMMIT_FREQUENCY_MILLIS", "123");
     env::set_var("ACCOUNTS_COMMIT_COMPUTE_UNIT_PRICE", "1");
-    env::set_var("ACCOUNTS_CREATE", "false");
     env::set_var("RPC_ADDR", "0.1.0.1");
     env::set_var("RPC_PORT", "123");
     env::set_var("GEYSER_GRPC_ADDR", "0.1.0.1");
@@ -95,15 +92,11 @@ fn test_load_local_dev_with_programs_toml_envs_override() {
         config,
         SleipnirConfig {
             accounts: AccountsConfig {
-                clone: CloneStrategy {
-                    readonly: ReadonlyMode::All,
-                    writable: WritableMode::Delegated,
-                },
+                lifecycle: LifecycleMode::EphemeralLimited,
                 commit: CommitStrategy {
                     frequency_millis: 123,
                     compute_unit_price: 1,
                 },
-                create: false,
                 remote: RemoteConfig::Custom(Url::parse(base_cluster).unwrap()),
                 ..Default::default()
             },

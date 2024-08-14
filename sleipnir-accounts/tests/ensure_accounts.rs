@@ -7,8 +7,7 @@ use conjunto_transwise::{
     transaction_accounts_validator::TransactionAccountsValidatorImpl,
 };
 use sleipnir_accounts::{
-    errors::AccountsError, ExternalAccountsManager, ExternalReadonlyMode,
-    ExternalWritableMode,
+    errors::AccountsError, ExternalAccountsManager, LifecycleMode,
 };
 use solana_sdk::{native_token::LAMPORTS_PER_SOL, pubkey::Pubkey};
 use stubs::{
@@ -24,15 +23,13 @@ use test_tools_core::init_logger;
 mod stubs;
 
 #[allow(clippy::too_many_arguments)]
-fn setup_customized(
+fn setup_with_lifecycle(
     internal_account_provider: InternalAccountProviderStub,
     account_fetcher: AccountFetcherStub,
     account_cloner: AccountClonerStub,
     account_committer: AccountCommitterStub,
     account_updates: AccountUpdatesStub,
-    external_readonly_mode: ExternalReadonlyMode,
-    external_writable_mode: ExternalWritableMode,
-    create_accounts: bool,
+    lifecycle: LifecycleMode,
 ) -> ExternalAccountsManager<
     InternalAccountProviderStub,
     AccountFetcherStub,
@@ -55,15 +52,13 @@ fn setup_customized(
         external_readonly_accounts: Default::default(),
         external_writable_accounts: Default::default(),
         scheduled_commits_processor: ScheduledCommitsProcessorStub::default(),
-        external_readonly_mode,
-        external_writable_mode,
-        create_accounts,
+        lifecycle,
         payer_init_lamports: Some(1_000 * LAMPORTS_PER_SOL),
         validator_id: validator_auth_id,
     }
 }
 
-fn setup_standard(
+fn setup_ephem(
     internal_account_provider: InternalAccountProviderStub,
     account_fetcher: AccountFetcherStub,
     account_cloner: AccountClonerStub,
@@ -79,15 +74,13 @@ fn setup_standard(
     TransactionAccountsValidatorImpl,
     ScheduledCommitsProcessorStub,
 > {
-    setup_customized(
+    setup_with_lifecycle(
         internal_account_provider,
         account_fetcher,
         account_cloner,
         account_committer,
         account_updates,
-        ExternalReadonlyMode::All,
-        ExternalWritableMode::Delegated,
-        false,
+        LifecycleMode::Ephemeral,
     )
 }
 
@@ -105,7 +98,7 @@ async fn test_ensure_readonly_account_not_tracked_nor_in_our_validator() {
     let fetchable_at_slot = 42;
     account_fetcher.add_undelegated(readonly_undelegated, fetchable_at_slot);
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -146,7 +139,7 @@ async fn test_ensure_readonly_account_not_tracked_but_in_our_validator() {
 
     internal_account_provider.add(readonly_already_loaded, Default::default());
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -183,7 +176,7 @@ async fn test_ensure_readonly_account_cloned_but_not_in_our_validator() {
     let account_committer = AccountCommitterStub::default();
     let account_updates = AccountUpdatesStub::default();
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -235,7 +228,7 @@ async fn test_ensure_readonly_account_tracked_but_has_been_updated_on_chain() {
     account_updates
         .add_known_update(readonly_undelegated, updated_last_at_slot);
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -284,7 +277,7 @@ async fn test_ensure_readonly_account_tracked_and_no_recent_update_on_chain() {
     account_updates
         .add_known_update(readonly_undelegated, updated_last_at_slot);
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -338,7 +331,7 @@ async fn test_ensure_readonly_account_in_our_validator_and_unseen_writable() {
         fetchable_at_slot,
     );
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -393,7 +386,7 @@ async fn test_ensure_delegated_with_owner_and_unlocked_writable_payer() {
     account_fetcher
         .add_undelegated(writable_undelegated_payer, fetchable_at_slot);
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -459,15 +452,14 @@ async fn test_ensure_one_delegated_and_one_new_account_writable() {
     );
 
     // Note: since we use a writable new account, we need to allow it as part of the configuration
-    let manager = setup_customized(
+    // We can't use an ephemeral's configuration, that forbids new accounts to be writable
+    let manager = setup_with_lifecycle(
         internal_account_provider,
         account_fetcher,
         account_cloner,
         account_committer,
         account_updates,
-        ExternalReadonlyMode::All,
-        ExternalWritableMode::All,
-        true,
+        LifecycleMode::Replica,
     );
 
     let holder = TransactionAccountsHolder {
@@ -524,7 +516,7 @@ async fn test_ensure_multiple_accounts_coming_in_over_time() {
         fetchable_at_slot,
     );
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -650,7 +642,7 @@ async fn test_ensure_writable_account_fails_to_validate() {
     let account_committer = AccountCommitterStub::default();
     let account_updates = AccountUpdatesStub::default();
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -696,7 +688,7 @@ async fn test_ensure_accounts_seen_first_as_readonly_can_be_used_as_writable_lat
         fetchable_at_slot,
     );
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -799,7 +791,7 @@ async fn test_ensure_accounts_already_known_can_be_reused_as_writable_later() {
         fetchable_at_slot,
     );
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -877,7 +869,7 @@ async fn test_ensure_accounts_already_cloned_needs_reclone_after_updates() {
     account_fetcher.add_undelegated(account_undelegated, fetchable_at_slot);
     account_updates.add_known_update(account_undelegated, last_updated_at_slot);
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,
@@ -951,7 +943,7 @@ async fn test_ensure_accounts_already_known_can_be_reused_without_updates() {
     account_fetcher.add_undelegated(account_undelegated, fetchable_at_slot);
     account_updates.add_known_update(account_undelegated, last_updated_at_slot);
 
-    let manager = setup_standard(
+    let manager = setup_ephem(
         internal_account_provider,
         account_fetcher,
         account_cloner,

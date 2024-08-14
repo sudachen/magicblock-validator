@@ -1,27 +1,18 @@
 use std::error::Error;
 
-use sleipnir_accounts::{
-    Cluster, ExternalConfig, ExternalReadonlyMode, ExternalWritableMode,
-};
+use sleipnir_accounts::{Cluster, LifecycleMode};
 use solana_sdk::genesis_config::ClusterType;
 
 pub(crate) fn try_convert_accounts_config(
     conf: &sleipnir_config::AccountsConfig,
 ) -> Result<sleipnir_accounts::AccountsConfig, Box<dyn Error>> {
-    let cluster = cluster_from_remote(&conf.remote);
-    let readonly = readonly_mode_from_external(&conf.clone.readonly);
-    let writable = writable_mode_from_external(&conf.clone.writable);
+    let remote_cluster = cluster_from_remote(&conf.remote);
+    let lifecycle = lifecycle_mode_from_lifecycle_mode(&conf.lifecycle);
     let payer_init_lamports = conf.payer.try_init_lamports()?;
 
-    let external = ExternalConfig {
-        cluster,
-        readonly,
-        writable,
-    };
-
     Ok(sleipnir_accounts::AccountsConfig {
-        external,
-        create: conf.create,
+        remote_cluster,
+        lifecycle,
         payer_init_lamports,
         commit_compute_unit_price: conf.commit.compute_unit_price,
     })
@@ -29,7 +20,7 @@ pub(crate) fn try_convert_accounts_config(
 
 pub(crate) fn cluster_from_remote(
     remote: &sleipnir_config::RemoteConfig,
-) -> sleipnir_accounts::Cluster {
+) -> Cluster {
     use sleipnir_config::RemoteConfig::*;
     match remote {
         Devnet => Cluster::Known(ClusterType::Devnet),
@@ -40,24 +31,15 @@ pub(crate) fn cluster_from_remote(
     }
 }
 
-fn readonly_mode_from_external(
-    mode: &sleipnir_config::ReadonlyMode,
-) -> sleipnir_accounts::ExternalReadonlyMode {
-    use sleipnir_config::ReadonlyMode::*;
-    match mode {
-        All => ExternalReadonlyMode::All,
-        Programs => ExternalReadonlyMode::Programs,
-        None => ExternalReadonlyMode::None,
-    }
-}
-
-fn writable_mode_from_external(
-    mode: &sleipnir_config::WritableMode,
-) -> sleipnir_accounts::ExternalWritableMode {
-    use sleipnir_config::WritableMode::*;
-    match mode {
-        All => ExternalWritableMode::All,
-        Delegated => ExternalWritableMode::Delegated,
-        None => ExternalWritableMode::None,
+fn lifecycle_mode_from_lifecycle_mode(
+    clone: &sleipnir_config::LifecycleMode,
+) -> LifecycleMode {
+    use sleipnir_config::LifecycleMode::*;
+    match clone {
+        ProgramsReplica => LifecycleMode::ProgramsReplica,
+        Replica => LifecycleMode::Replica,
+        EphemeralLimited => LifecycleMode::EphemeralLimited,
+        Ephemeral => LifecycleMode::Ephemeral,
+        Offline => LifecycleMode::Offline,
     }
 }

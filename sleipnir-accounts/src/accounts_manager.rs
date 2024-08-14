@@ -58,10 +58,9 @@ impl
     ) -> AccountsResult<Self> {
         let validator_id = validator_keypair.pubkey();
 
-        let external_config = config.external;
-        let cluster = external_config.cluster;
+        let remote_cluster = config.remote_cluster;
         let internal_account_provider = BankAccountProvider::new(bank.clone());
-        let rpc_cluster = try_rpc_cluster_from_cluster(&cluster)?;
+        let rpc_cluster = try_rpc_cluster_from_cluster(&remote_cluster)?;
         let rpc_client = RpcClient::new_with_commitment(
             rpc_cluster.url().to_string(),
             CommitmentConfig::confirmed(),
@@ -72,7 +71,7 @@ impl
             RemoteAccountFetcher::new(rpc_provider_config.clone());
 
         let account_cloner = RemoteAccountCloner::new(
-            cluster.clone(),
+            remote_cluster.clone(),
             bank.clone(),
             transaction_status_sender.clone(),
         );
@@ -83,7 +82,7 @@ impl
         );
 
         let scheduled_commits_processor = RemoteScheduledCommitsProcessor::new(
-            cluster,
+            remote_cluster,
             bank.clone(),
             transaction_status_sender,
         );
@@ -98,9 +97,7 @@ impl
             transaction_accounts_validator: TransactionAccountsValidatorImpl,
             external_readonly_accounts: ExternalReadonlyAccounts::default(),
             external_writable_accounts: ExternalWritableAccounts::default(),
-            external_readonly_mode: external_config.readonly,
-            external_writable_mode: external_config.writable,
-            create_accounts: config.create,
+            lifecycle: config.lifecycle,
             scheduled_commits_processor,
             payer_init_lamports: config.payer_init_lamports,
             validator_id,

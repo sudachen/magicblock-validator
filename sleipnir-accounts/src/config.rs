@@ -1,70 +1,68 @@
 use sleipnir_mutator::Cluster;
-use solana_sdk::genesis_config::ClusterType;
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct AccountsConfig {
-    pub external: ExternalConfig,
-    pub create: bool,
+    pub remote_cluster: Cluster,
+    pub lifecycle: LifecycleMode,
     pub commit_compute_unit_price: u64,
     pub payer_init_lamports: Option<u64>,
 }
 
-// -----------------
-// ExternalConfig
-// -----------------
 #[derive(Debug, PartialEq, Eq)]
-pub struct ExternalConfig {
-    pub cluster: Cluster,
-    pub readonly: ExternalReadonlyMode,
-    pub writable: ExternalWritableMode,
+pub enum LifecycleMode {
+    Replica,
+    ProgramsReplica,
+    Ephemeral,
+    EphemeralLimited,
+    Offline,
 }
 
-impl Default for ExternalConfig {
-    fn default() -> Self {
-        Self {
-            cluster: Cluster::Known(ClusterType::Devnet),
-            readonly: Default::default(),
-            writable: Default::default(),
+impl LifecycleMode {
+    pub fn is_clone_readable_none(&self) -> bool {
+        match self {
+            LifecycleMode::Replica => false,
+            LifecycleMode::ProgramsReplica => false,
+            LifecycleMode::Ephemeral => false,
+            LifecycleMode::EphemeralLimited => false,
+            LifecycleMode::Offline => true,
         }
     }
-}
+    pub fn is_clone_readable_programs_only(&self) -> bool {
+        match self {
+            LifecycleMode::Replica => false,
+            LifecycleMode::ProgramsReplica => true,
+            LifecycleMode::Ephemeral => false,
+            LifecycleMode::EphemeralLimited => true,
+            LifecycleMode::Offline => false,
+        }
+    }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub enum ExternalReadonlyMode {
-    All,
-    #[default]
-    Programs,
-    None,
-}
+    pub fn is_clone_writable_none(&self) -> bool {
+        match self {
+            LifecycleMode::Replica => false,
+            LifecycleMode::ProgramsReplica => true,
+            LifecycleMode::Ephemeral => false,
+            LifecycleMode::EphemeralLimited => false,
+            LifecycleMode::Offline => true,
+        }
+    }
 
-impl ExternalReadonlyMode {
-    pub fn is_clone_all(&self) -> bool {
-        matches!(self, Self::All)
+    pub fn requires_delegation_for_writables(&self) -> bool {
+        match self {
+            LifecycleMode::Replica => false,
+            LifecycleMode::ProgramsReplica => false,
+            LifecycleMode::Ephemeral => true,
+            LifecycleMode::EphemeralLimited => true,
+            LifecycleMode::Offline => false,
+        }
     }
-    pub fn is_clone_programs_only(&self) -> bool {
-        matches!(self, Self::Programs)
-    }
-    pub fn is_clone_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub enum ExternalWritableMode {
-    All,
-    Delegated,
-    #[default]
-    None,
-}
-
-impl ExternalWritableMode {
-    pub fn is_clone_all(&self) -> bool {
-        matches!(self, Self::All)
-    }
-    pub fn is_clone_delegated_only(&self) -> bool {
-        matches!(self, Self::Delegated)
-    }
-    pub fn is_clone_none(&self) -> bool {
-        matches!(self, Self::None)
+    pub fn allows_new_account_for_writables(&self) -> bool {
+        match self {
+            LifecycleMode::Replica => true,
+            LifecycleMode::ProgramsReplica => true,
+            LifecycleMode::Ephemeral => false,
+            LifecycleMode::EphemeralLimited => false,
+            LifecycleMode::Offline => true,
+        }
     }
 }

@@ -23,11 +23,7 @@ pub use validator::*;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SleipnirConfig {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_accounts_config",
-        serialize_with = "serialize_accounts_config"
-    )]
+    #[serde(default)]
     pub accounts: AccountsConfig,
     #[serde(default)]
     pub rpc: RpcConfig,
@@ -38,36 +34,6 @@ pub struct SleipnirConfig {
     #[serde(default)]
     #[serde(rename = "program")]
     pub programs: Vec<ProgramConfig>,
-}
-
-fn deserialize_accounts_config<'de, D>(
-    deserializer: D,
-) -> Result<AccountsConfig, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    AccountsConfig::deserialize(deserializer)
-        .map(|accounts_config| {
-            if accounts_config.create
-                && accounts_config.clone.writable == WritableMode::Delegated
-            {
-                return Err(serde::de::Error::custom(
-                    "AccountsConfig cannot have a [accounts.clone] writable = 'delegated' while allowing new accounts to be created at the same time."
-                    .to_string()
-                ));
-            }
-            Ok(accounts_config)
-        })?
-}
-
-fn serialize_accounts_config<S>(
-    accounts_config: &AccountsConfig,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    accounts_config.serialize(serializer)
 }
 
 impl SleipnirConfig {
@@ -123,14 +89,13 @@ impl SleipnirConfig {
             );
         }
 
-        if let Ok(readonly) = env::var("ACCOUNTS_CLONE_READONLY") {
-            config.accounts.clone.readonly = readonly.parse()
-                .unwrap_or_else(|err| panic!("Failed to parse 'ACCOUNTS_CLONE_READONLY' as ReadonlyMode: {:?}", err))
-        }
-
-        if let Ok(writable) = env::var("ACCOUNTS_CLONE_WRITABLE") {
-            config.accounts.clone.writable = writable.parse()
-                .unwrap_or_else(|err| panic!("Failed to parse 'ACCOUNTS_CLONE_WRITABLE' as WritableMode: {:?}", err));
+        if let Ok(lifecycle) = env::var("ACCOUNTS_LIFECYCLE") {
+            config.accounts.lifecycle = lifecycle.parse().unwrap_or_else(|err| {
+                panic!(
+                    "Failed to parse 'ACCOUNTS_LIFECYCLE' as LifecycleMode: {}: {:?}",
+                    lifecycle, err
+                )
+            })
         }
 
         if let Ok(frequency_millis) =
@@ -143,16 +108,6 @@ impl SleipnirConfig {
         if let Ok(unit_price) = env::var("ACCOUNTS_COMMIT_COMPUTE_UNIT_PRICE") {
             config.accounts.commit.compute_unit_price = u64::from_str(&unit_price)
                 .unwrap_or_else(|err| panic!("Failed to parse 'ACCOUNTS_COMMIT_COMPUTE_UNIT_PRICE' as u64: {:?}", err))
-        }
-
-        if let Ok(create) = env::var("ACCOUNTS_CREATE") {
-            config.accounts.create =
-                bool::from_str(&create).unwrap_or_else(|err| {
-                    panic!(
-                        "Failed to parse 'ACCOUNTS_CREATE' as bool: {:?}",
-                        err
-                    )
-                })
         }
 
         if let Ok(addr) = env::var("RPC_ADDR") {

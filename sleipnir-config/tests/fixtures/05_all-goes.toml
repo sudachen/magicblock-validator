@@ -2,8 +2,7 @@
 # not found are either created as part of the transaction or result in
 # account missing as usual
 [accounts]
-clone = { readonly = "all", writable = "all" }
-create = true
+lifecycle = "replica"
 
 # Additionally we turn off signature verification to allow
 # unlimited experimentation
