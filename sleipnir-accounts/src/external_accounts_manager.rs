@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use conjunto_transwise::{
     account_fetcher::AccountFetcher,
@@ -9,11 +9,13 @@ use conjunto_transwise::{
     },
     AccountChainState,
 };
+use lazy_static::lazy_static;
 use log::*;
 use sleipnir_account_updates::AccountUpdates;
 use sleipnir_mutator::AccountModification;
 use solana_sdk::{
-    pubkey::Pubkey, signature::Signature, transaction::SanitizedTransaction,
+    pubkey::Pubkey, signature::Signature, sysvar,
+    transaction::SanitizedTransaction,
 };
 
 use crate::{
@@ -24,6 +26,27 @@ use crate::{
     AccountCommittee, CommitAccountsPayload, LifecycleMode,
     ScheduledCommitsProcessor, SendableCommitAccountsPayload,
 };
+
+lazy_static! {
+    // TODO(vbrunet) - we will need a more general solution to those unfetchable accounts
+    // progress tracked here: https://github.com/magicblock-labs/magicblock-validator/issues/124
+    static ref BLACKLISTED_ACCOUNTS: HashSet<Pubkey> = {
+        let mut accounts = HashSet::new();
+        accounts.insert(sysvar::clock::ID);
+        accounts.insert(sysvar::epoch_rewards::ID);
+        accounts.insert(sysvar::epoch_schedule::ID);
+        accounts.insert(sysvar::fees::ID);
+        accounts.insert(sysvar::instructions::ID);
+        accounts.insert(sysvar::last_restart_slot::ID);
+        accounts.insert(sysvar::recent_blockhashes::ID);
+        accounts.insert(sysvar::rent::ID);
+        accounts.insert(sysvar::rewards::ID);
+        accounts.insert(sysvar::slot_hashes::ID);
+        accounts.insert(sysvar::slot_history::ID);
+        accounts.insert(sysvar::stake_history::ID);
+        accounts
+    };
+}
 
 #[derive(Debug)]
 pub struct ExternalAccountsManager<IAP, AFE, ACL, ACM, AUP, TAE, TAV, SCP>
@@ -102,6 +125,9 @@ where
                 .into_iter()
                 // We never want to clone the validator authority account
                 .filter(|pubkey| !self.validator_id.eq(pubkey))
+                // We also never fetch some black-listed accounts (sysvars for example)
+                .filter(|pubkey| !BLACKLISTED_ACCOUNTS.contains(pubkey))
+                // Otherwise check if we know about the account from previous transactions
                 .filter(|pubkey| {
                     // If an account has already been cloned and prepared to be used as writable,
                     // it can also be used as readonly, no questions asked, as it is already delegated
