@@ -12,7 +12,12 @@ use lazy_static::lazy_static;
 use log::*;
 use sleipnir_account_fetcher::AccountFetcher;
 use sleipnir_account_updates::AccountUpdates;
-use sleipnir_program::sleipnir_instruction::AccountModification;
+use sleipnir_bank::bank::Bank;
+use sleipnir_program::{
+    process_accounts_pending_removal_transaction,
+    sleipnir_instruction::AccountModification, traits::AccountsRemover,
+};
+use sleipnir_transaction_status::TransactionStatusSender;
 use solana_sdk::{
     pubkey::Pubkey, signature::Signature, sysvar,
     transaction::SanitizedTransaction,
@@ -20,11 +25,13 @@ use solana_sdk::{
 
 use crate::{
     errors::{AccountsError, AccountsResult},
+    execute_legacy_transaction,
     external_accounts::{ExternalReadonlyAccounts, ExternalWritableAccounts},
     traits::{AccountCloner, AccountCommitter, InternalAccountProvider},
     utils::get_epoch,
     AccountCommittee, CommitAccountsPayload, LifecycleMode,
-    ScheduledCommitsProcessor, SendableCommitAccountsPayload,
+    PendingCommitTransaction, ScheduledCommitsProcessor,
+    SendableCommitAccountsPayload, UndelegationRequest,
 };
 
 lazy_static! {
@@ -49,12 +56,13 @@ lazy_static! {
 }
 
 #[derive(Debug)]
-pub struct ExternalAccountsManager<IAP, AFE, ACL, ACM, AUP, TAE, TAV, SCP>
+pub struct ExternalAccountsManager<IAP, AFE, ACL, ACM, ARE, AUP, TAE, TAV, SCP>
 where
     IAP: InternalAccountProvider,
     AFE: AccountFetcher,
     ACL: AccountCloner,
     ACM: AccountCommitter,
+    ARE: AccountsRemover,
     AUP: AccountUpdates,
     TAE: TransactionAccountsExtractor,
     TAV: TransactionAccountsValidator,
@@ -63,10 +71,12 @@ where
     pub internal_account_provider: IAP,
     pub account_fetcher: AFE,
     pub account_cloner: ACL,
+    pub accounts_remover: ARE,
     pub account_committer: Arc<ACM>,
     pub account_updates: AUP,
     pub transaction_accounts_extractor: TAE,
     pub transaction_accounts_validator: TAV,
+    pub transaction_status_sender: Option<TransactionStatusSender>,
     pub scheduled_commits_processor: SCP,
     pub external_readonly_accounts: ExternalReadonlyAccounts,
     pub external_writable_accounts: ExternalWritableAccounts,
@@ -75,13 +85,14 @@ where
     pub validator_id: Pubkey,
 }
 
-impl<IAP, AFE, ACL, ACM, AUP, TAE, TAV, SCP>
-    ExternalAccountsManager<IAP, AFE, ACL, ACM, AUP, TAE, TAV, SCP>
+impl<IAP, AFE, ACL, ACM, ARE, AUP, TAE, TAV, SCP>
+    ExternalAccountsManager<IAP, AFE, ACL, ACM, ARE, AUP, TAE, TAV, SCP>
 where
     IAP: InternalAccountProvider,
     AFE: AccountFetcher,
     ACL: AccountCloner,
     ACM: AccountCommitter,
+    ARE: AccountsRemover,
     AUP: AccountUpdates,
     TAE: TransactionAccountsExtractor,
     TAV: TransactionAccountsValidator,
@@ -371,9 +382,19 @@ where
             .filter(|x| x.needs_commit(now))
             .map(|x| x.pubkey)
             .collect::<Vec<_>>();
+
+        // NOTE: the scheduled commits use the slot at which the commit was scheduled
+        // However frequent commits run async and could be running before a slot is completed
+        // Thus they really commit in between two slots instead of at the end of a particular slot.
+        // Therefore we use the current slot which could result in two commits with the same
+        // slot. However since we most likely will phase out frequent commits we accept this
+        // inconsistency for now.
+        let slot = self.internal_account_provider.get_slot();
         let commit_infos = self
             .create_transactions_to_commit_specific_accounts(
                 accounts_to_be_committed,
+                slot,
+                None,
             )
             .await?;
         let sendables = commit_infos
@@ -386,13 +407,18 @@ where
                 None => None,
             })
             .collect::<Vec<_>>();
+        // NOTE: we ignore the [PendingCommitTransaction::undelegated_accounts] here since for
+        // scheduled commits we never request undelegation
         self.run_transactions_to_commit_specific_accounts(now, sendables)
             .await
+            .map(|pendings| pendings.into_iter().map(|x| x.signature).collect())
     }
 
-    pub async fn create_transactions_to_commit_specific_accounts(
+    async fn create_transactions_to_commit_specific_accounts(
         &self,
         accounts_to_be_committed: Vec<Pubkey>,
+        slot: u64,
+        undelegation_request: Option<UndelegationRequest>,
     ) -> AccountsResult<Vec<CommitAccountsPayload>> {
         // Get current account states from internal account provider
         let mut committees = Vec::new();
@@ -403,6 +429,8 @@ where
                 committees.push(AccountCommittee {
                     pubkey: *pubkey,
                     account_data: acc,
+                    slot,
+                    undelegation_request: undelegation_request.clone(),
                 });
             } else {
                 error!(
@@ -427,14 +455,14 @@ where
         &self,
         now: Duration,
         payloads: Vec<SendableCommitAccountsPayload>,
-    ) -> AccountsResult<Vec<Signature>> {
+    ) -> AccountsResult<Vec<PendingCommitTransaction>> {
         let pubkeys = payloads
             .iter()
             .flat_map(|x| x.committees.iter().map(|x| x.0))
             .collect::<Vec<_>>();
 
         // Commit all transactions
-        let signatures = self
+        let pending_commits = self
             .account_committer
             .send_commit_transactions(payloads)
             .await?;
@@ -454,7 +482,7 @@ where
             }
         }
 
-        Ok(signatures)
+        Ok(pending_commits)
     }
 
     pub fn last_commit(&self, pubkey: &Pubkey) -> Option<Duration> {
@@ -466,7 +494,44 @@ where
 
     pub async fn process_scheduled_commits(&self) -> AccountsResult<()> {
         self.scheduled_commits_processor
-            .process(&self.account_committer, &self.internal_account_provider)
+            .process(
+                &self.account_committer,
+                &self.internal_account_provider,
+                &self.accounts_remover,
+            )
             .await
+    }
+
+    // -----------------
+    // Accounts removal
+    // -----------------
+    pub fn remove_accounts_pending_removal(
+        &self,
+        bank: &Arc<Bank>,
+    ) -> AccountsResult<Option<Signature>> {
+        let accounts = self.accounts_remover.accounts_pending_removal();
+        if !accounts.is_empty() {
+            // We first clear the accounts from the accounts manager in order to
+            // force a fresh clone should anyone want to use the account
+            for pubkey in &accounts {
+                self.external_readonly_accounts.remove(pubkey);
+                self.external_writable_accounts.remove(pubkey);
+            }
+
+            // Then we remove the accounts from the bank via a transaction
+            let blockhash = bank.last_blockhash();
+            let tx = process_accounts_pending_removal_transaction(
+                accounts, blockhash,
+            );
+            let sig = execute_legacy_transaction(
+                tx,
+                bank,
+                self.transaction_status_sender.as_ref(),
+            )?;
+
+            Ok(Some(sig))
+        } else {
+            Ok(None)
+        }
     }
 }

@@ -7,6 +7,7 @@ use conjunto_transwise::{
 use sleipnir_account_fetcher::RemoteAccountFetcherClient;
 use sleipnir_account_updates::RemoteAccountUpdatesClient;
 use sleipnir_bank::bank::Bank;
+use sleipnir_program::ValidatorAccountsRemover;
 use sleipnir_transaction_status::TransactionStatusSender;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -30,24 +31,14 @@ pub type AccountsManager = ExternalAccountsManager<
     RemoteAccountFetcherClient,
     RemoteAccountCloner,
     RemoteAccountCommitter,
+    ValidatorAccountsRemover,
     RemoteAccountUpdatesClient,
     TransactionAccountsExtractorImpl,
     TransactionAccountsValidatorImpl,
     RemoteScheduledCommitsProcessor,
 >;
 
-impl
-    ExternalAccountsManager<
-        BankAccountProvider,
-        RemoteAccountFetcherClient,
-        RemoteAccountCloner,
-        RemoteAccountCommitter,
-        RemoteAccountUpdatesClient,
-        TransactionAccountsExtractorImpl,
-        TransactionAccountsValidatorImpl,
-        RemoteScheduledCommitsProcessor,
-    >
-{
+impl AccountsManager {
     pub fn try_new(
         bank: &Arc<Bank>,
         remote_account_fetcher_client: RemoteAccountFetcherClient,
@@ -79,7 +70,7 @@ impl
         let scheduled_commits_processor = RemoteScheduledCommitsProcessor::new(
             remote_cluster,
             bank.clone(),
-            transaction_status_sender,
+            transaction_status_sender.clone(),
         );
 
         Ok(Self {
@@ -87,9 +78,11 @@ impl
             account_fetcher: remote_account_fetcher_client,
             account_cloner,
             account_committer: Arc::new(account_committer),
+            accounts_remover: ValidatorAccountsRemover::default(),
             account_updates: remote_account_updates_client,
             transaction_accounts_extractor: TransactionAccountsExtractorImpl,
             transaction_accounts_validator: TransactionAccountsValidatorImpl,
+            transaction_status_sender,
             external_readonly_accounts: ExternalReadonlyAccounts::default(),
             external_writable_accounts: ExternalWritableAccounts::default(),
             lifecycle: config.lifecycle,
