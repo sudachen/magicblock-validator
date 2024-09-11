@@ -1,10 +1,7 @@
 mod accounts_manager;
-mod bank_account_provider;
 mod config;
 pub mod errors;
-mod external_accounts;
-pub mod external_accounts_manager;
-mod remote_account_cloner;
+mod external_accounts_manager;
 mod remote_account_committer;
 mod remote_scheduled_commits_processor;
 mod traits;

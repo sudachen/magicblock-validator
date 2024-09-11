@@ -2,20 +2,19 @@ use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use log::*;
+use sleipnir_accounts_api::InternalAccountProvider;
 use sleipnir_bank::bank::Bank;
 use sleipnir_core::debug_panic;
 use sleipnir_mutator::Cluster;
+use sleipnir_processor::execute_transaction::execute_legacy_transaction;
 use sleipnir_program::{
-    register_scheduled_commit_sent,
-    traits::{AccountRemovalReason, AccountsRemover},
-    SentCommit, TransactionScheduler,
+    register_scheduled_commit_sent, SentCommit, TransactionScheduler,
 };
 use sleipnir_transaction_status::TransactionStatusSender;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 
 use crate::{
-    errors::AccountsResult, utils::execute_legacy_transaction,
-    AccountCommittee, AccountCommitter, InternalAccountProvider,
+    errors::AccountsResult, AccountCommittee, AccountCommitter,
     ScheduledCommitsProcessor, SendableCommitAccountsPayload,
     UndelegationRequest,
 };
@@ -30,16 +29,14 @@ pub struct RemoteScheduledCommitsProcessor {
 
 #[async_trait]
 impl ScheduledCommitsProcessor for RemoteScheduledCommitsProcessor {
-    async fn process<AC, IAP, AR>(
+    async fn process<AC, IAP>(
         &self,
         committer: &Arc<AC>,
         account_provider: &IAP,
-        accounts_remover: &AR,
     ) -> AccountsResult<()>
     where
         AC: AccountCommitter,
         IAP: InternalAccountProvider,
-        AR: AccountsRemover,
     {
         let scheduled_commits =
             self.transaction_scheduler.take_scheduled_commits();
@@ -170,7 +167,6 @@ impl ScheduledCommitsProcessor for RemoteScheduledCommitsProcessor {
 
         self.process_accounts_commits_in_background(
             committer,
-            accounts_remover,
             sendable_payloads_queue,
         );
 
@@ -192,13 +188,9 @@ impl RemoteScheduledCommitsProcessor {
         }
     }
 
-    fn process_accounts_commits_in_background<
-        AC: AccountCommitter,
-        AR: AccountsRemover,
-    >(
+    fn process_accounts_commits_in_background<AC: AccountCommitter>(
         &self,
         committer: &Arc<AC>,
-        remover: &AR,
         sendable_payloads_queue: Vec<SendableCommitAccountsPayload>,
     ) {
         // We process the queue on a separate task in order to not block
@@ -208,7 +200,6 @@ impl RemoteScheduledCommitsProcessor {
         // We will need some tracking machinery which is overkill until we get to the
         // point where we do allow validator shutdown
         let committer = committer.clone();
-        let remover = remover.clone();
         tokio::task::spawn(async move {
             let pending_commits = match committer
                 .send_commit_transactions(sendable_payloads_queue)
@@ -227,20 +218,16 @@ impl RemoteScheduledCommitsProcessor {
                 .into_iter()
                 .flat_map(|commit| commit.undelegated_accounts.into_iter())
                 .collect::<HashSet<Pubkey>>();
-            if !undelegated_accounts.is_empty() {
-                if log::log_enabled!(log::Level::Debug) {
-                    debug!(
-                        "Requesting to undelegate: {}",
-                        undelegated_accounts
-                            .iter()
-                            .map(|x| x.to_string())
-                            .collect::<Vec<String>>()
-                            .join(", ")
-                    );
-                }
-                remover.request_accounts_removal(
-                    undelegated_accounts,
-                    AccountRemovalReason::Undelegated,
+            if !undelegated_accounts.is_empty()
+                && log::log_enabled!(log::Level::Debug)
+            {
+                debug!(
+                    "Requesting to undelegate: {}",
+                    undelegated_accounts
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<String>>()
+                        .join(", ")
                 );
             }
         });

@@ -18,35 +18,51 @@ pub enum LifecycleMode {
 }
 
 impl LifecycleMode {
-    pub fn is_clone_readable_none(&self) -> bool {
+    pub fn allow_cloning_new_accounts(&self) -> bool {
         match self {
-            LifecycleMode::Replica => false,
+            LifecycleMode::Replica => true,
             LifecycleMode::ProgramsReplica => false,
-            LifecycleMode::Ephemeral => false,
-            LifecycleMode::EphemeralLimited => false,
-            LifecycleMode::Offline => true,
-        }
-    }
-    pub fn is_clone_readable_programs_only(&self) -> bool {
-        match self {
-            LifecycleMode::Replica => false,
-            LifecycleMode::ProgramsReplica => true,
-            LifecycleMode::Ephemeral => false,
+            LifecycleMode::Ephemeral => true,
             LifecycleMode::EphemeralLimited => true,
             LifecycleMode::Offline => false,
         }
     }
-
-    pub fn is_clone_writable_none(&self) -> bool {
+    pub fn allow_cloning_payer_accounts(&self) -> bool {
         match self {
-            LifecycleMode::Replica => false,
-            LifecycleMode::ProgramsReplica => true,
-            LifecycleMode::Ephemeral => false,
-            LifecycleMode::EphemeralLimited => false,
-            LifecycleMode::Offline => true,
+            LifecycleMode::Replica => true,
+            LifecycleMode::ProgramsReplica => false,
+            LifecycleMode::Ephemeral => true,
+            LifecycleMode::EphemeralLimited => true,
+            LifecycleMode::Offline => false,
         }
     }
-
+    pub fn allow_cloning_pda_accounts(&self) -> bool {
+        match self {
+            LifecycleMode::Replica => true,
+            LifecycleMode::ProgramsReplica => false,
+            LifecycleMode::Ephemeral => true,
+            LifecycleMode::EphemeralLimited => false,
+            LifecycleMode::Offline => false,
+        }
+    }
+    pub fn allow_cloning_delegated_accounts(&self) -> bool {
+        match self {
+            LifecycleMode::Replica => true,
+            LifecycleMode::ProgramsReplica => false,
+            LifecycleMode::Ephemeral => true,
+            LifecycleMode::EphemeralLimited => true,
+            LifecycleMode::Offline => false,
+        }
+    }
+    pub fn allow_cloning_program_accounts(&self) -> bool {
+        match self {
+            LifecycleMode::Replica => true,
+            LifecycleMode::ProgramsReplica => true,
+            LifecycleMode::Ephemeral => true,
+            LifecycleMode::EphemeralLimited => true,
+            LifecycleMode::Offline => false,
+        }
+    }
     pub fn requires_ephemeral_validation(&self) -> bool {
         match self {
             LifecycleMode::Replica => false,

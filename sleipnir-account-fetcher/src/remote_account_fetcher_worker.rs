@@ -11,23 +11,21 @@ use conjunto_transwise::{
 use futures_util::future::join_all;
 use log::*;
 use solana_sdk::pubkey::Pubkey;
-use tokio::sync::{
-    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    oneshot::Sender,
+use tokio::sync::mpsc::{
+    unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{AccountFetcherError, AccountFetcherResult};
+use crate::{AccountFetcherError, AccountFetcherListeners};
 
 pub struct RemoteAccountFetcherWorker {
     account_chain_snapshot_provider: AccountChainSnapshotProvider<
         RpcAccountProvider,
         DelegationRecordParserImpl,
     >,
-    request_receiver: UnboundedReceiver<Pubkey>,
-    request_sender: UnboundedSender<Pubkey>,
-    fetch_result_listeners:
-        Arc<RwLock<HashMap<Pubkey, Vec<Sender<AccountFetcherResult>>>>>,
+    fetch_request_receiver: UnboundedReceiver<Pubkey>,
+    fetch_request_sender: UnboundedSender<Pubkey>,
+    fetch_listeners: Arc<RwLock<HashMap<Pubkey, AccountFetcherListeners>>>,
 }
 
 impl RemoteAccountFetcherWorker {
@@ -36,37 +34,38 @@ impl RemoteAccountFetcherWorker {
             RpcAccountProvider::new(config),
             DelegationRecordParserImpl,
         );
-        let (request_sender, request_receiver) = unbounded_channel();
+        let (fetch_request_sender, fetch_request_receiver) =
+            unbounded_channel();
         Self {
             account_chain_snapshot_provider,
-            request_receiver,
-            request_sender,
-            fetch_result_listeners: Default::default(),
+            fetch_request_receiver,
+            fetch_request_sender,
+            fetch_listeners: Default::default(),
         }
     }
 
-    pub fn get_request_sender(&self) -> UnboundedSender<Pubkey> {
-        self.request_sender.clone()
+    pub fn get_fetch_request_sender(&self) -> UnboundedSender<Pubkey> {
+        self.fetch_request_sender.clone()
     }
 
-    pub fn get_fetch_result_listeners(
+    pub fn get_fetch_listeners(
         &self,
-    ) -> Arc<RwLock<HashMap<Pubkey, Vec<Sender<AccountFetcherResult>>>>> {
-        self.fetch_result_listeners.clone()
+    ) -> Arc<RwLock<HashMap<Pubkey, AccountFetcherListeners>>> {
+        self.fetch_listeners.clone()
     }
 
-    pub async fn start_fetch_request_listener(
+    pub async fn start_fetch_request_processing(
         &mut self,
         cancellation_token: CancellationToken,
     ) {
         loop {
             let mut requests = vec![];
             tokio::select! {
-                _ = self.request_receiver.recv_many(&mut requests, 100) => {
+                _ = self.fetch_request_receiver.recv_many(&mut requests, 100) => {
                     join_all(
                         requests
                             .into_iter()
-                            .map(|request| self.do_fetch(request))
+                            .map(|request| self.process_fetch_request(request))
                     ).await;
                 }
                 _ = cancellation_token.cancelled() => {
@@ -76,25 +75,28 @@ impl RemoteAccountFetcherWorker {
         }
     }
 
-    async fn do_fetch(&self, pubkey: Pubkey) {
+    async fn process_fetch_request(&self, pubkey: Pubkey) {
+        // Actually fetch the account asynchronously
         let result = match self
             .account_chain_snapshot_provider
             .try_fetch_chain_snapshot_of_pubkey(&pubkey)
             .await
         {
             Ok(snapshot) => Ok(AccountChainSnapshotShared::from(snapshot)),
+            // LockboxError is unclonable, so we have to downgrade it to a clonable error type
             Err(error) => {
-                // Log the error now, since we're going to lose the stacktrace later
+                // Log the error now, since we're going to lose the stacktrace after string conversion
                 warn!("Failed to fetch account: {} :{:?}", pubkey, error);
-                // Lose the error content and create a simplified clonable version
+                // Lose the error full stack trace and create a simplified clonable string version
                 Err(AccountFetcherError::FailedToFetch(error.to_string()))
             }
         };
+        // Collect the listeners waiting for the result
         let listeners = match self
-            .fetch_result_listeners
+            .fetch_listeners
             .write()
             .expect(
-                "RwLock of RemoteAccountFetcherWorker.fetch_result_listeners is poisoned",
+                "RwLock of RemoteAccountFetcherWorker.fetch_listeners is poisoned",
             )
             .entry(pubkey)
         {
@@ -105,9 +107,10 @@ impl RemoteAccountFetcherWorker {
             // If the entry exists, we want to consume the list of listeners
             Entry::Occupied(entry) => entry.remove(),
         };
+        // Notify the listeners of the arrival of the result
         for listener in listeners {
             if let Err(error) = listener.send(result.clone()) {
-                error!("Could not send fetch resut: {}: {:?}", pubkey, error);
+                error!("Could not send fetch result: {}: {:?}", pubkey, error);
             }
         }
     }

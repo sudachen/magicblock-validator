@@ -33,25 +33,26 @@ pub enum RemoteAccountUpdatesWorkerError {
 }
 
 pub struct RemoteAccountUpdatesWorker {
-    config: RpcProviderConfig,
-    request_receiver: UnboundedReceiver<Pubkey>,
-    request_sender: UnboundedSender<Pubkey>,
+    rpc_provider_config: RpcProviderConfig,
+    monitoring_request_receiver: UnboundedReceiver<Pubkey>,
+    monitoring_request_sender: UnboundedSender<Pubkey>,
     last_known_update_slots: Arc<RwLock<HashMap<Pubkey, Slot>>>,
 }
 
 impl RemoteAccountUpdatesWorker {
-    pub fn new(config: RpcProviderConfig) -> Self {
-        let (request_sender, request_receiver) = unbounded_channel();
+    pub fn new(rpc_provider_config: RpcProviderConfig) -> Self {
+        let (monitoring_request_sender, monitoring_request_receiver) =
+            unbounded_channel();
         Self {
-            config,
-            request_sender,
-            request_receiver,
+            rpc_provider_config,
+            monitoring_request_receiver,
+            monitoring_request_sender,
             last_known_update_slots: Default::default(),
         }
     }
 
-    pub fn get_request_sender(&self) -> UnboundedSender<Pubkey> {
-        self.request_sender.clone()
+    pub fn get_monitoring_request_sender(&self) -> UnboundedSender<Pubkey> {
+        self.monitoring_request_sender.clone()
     }
 
     pub fn get_last_known_update_slots(
@@ -60,23 +61,23 @@ impl RemoteAccountUpdatesWorker {
         self.last_known_update_slots.clone()
     }
 
-    pub async fn start_monitoring(
+    pub async fn start_monitoring_request_processing(
         &mut self,
         cancellation_token: CancellationToken,
     ) -> Result<(), RemoteAccountUpdatesWorkerError> {
         let pubsub_client = Arc::new(
-            PubsubClient::new(self.config.ws_url())
+            PubsubClient::new(self.rpc_provider_config.ws_url())
                 .await
                 .map_err(RemoteAccountUpdatesWorkerError::PubsubClientError)?,
         );
-        let commitment = self.config.commitment();
+        let commitment = self.rpc_provider_config.commitment();
 
         let mut subscriptions_cancellation_tokens = HashMap::new();
         let mut subscriptions_join_handles = vec![];
 
         loop {
             tokio::select! {
-                Some(request) = self.request_receiver.recv() => {
+                Some(request) = self.monitoring_request_receiver.recv() => {
                     if let Entry::Vacant(entry) = subscriptions_cancellation_tokens.entry(request) {
                         let subscription_cancellation_token = CancellationToken::new();
                         entry.insert(subscription_cancellation_token.clone());

@@ -3,32 +3,29 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use conjunto_transwise::AccountChainSnapshotShared;
 use futures_util::{
     future::{ready, BoxFuture},
     FutureExt,
 };
 use solana_sdk::pubkey::Pubkey;
-use tokio::sync::{
-    mpsc::UnboundedSender,
-    oneshot::{channel, Sender},
-};
+use tokio::sync::{mpsc::UnboundedSender, oneshot::channel};
 
 use crate::{
-    AccountFetcher, AccountFetcherError, AccountFetcherResult,
-    RemoteAccountFetcherWorker,
+    AccountFetcher, AccountFetcherError, AccountFetcherListeners,
+    AccountFetcherResult, RemoteAccountFetcherWorker,
 };
 
 pub struct RemoteAccountFetcherClient {
-    request_sender: UnboundedSender<Pubkey>,
-    fetch_result_listeners:
-        Arc<RwLock<HashMap<Pubkey, Vec<Sender<AccountFetcherResult>>>>>,
+    fetch_request_sender: UnboundedSender<Pubkey>,
+    fetch_listeners: Arc<RwLock<HashMap<Pubkey, AccountFetcherListeners>>>,
 }
 
 impl RemoteAccountFetcherClient {
-    pub fn new(runner: &RemoteAccountFetcherWorker) -> Self {
+    pub fn new(worker: &RemoteAccountFetcherWorker) -> Self {
         Self {
-            request_sender: runner.get_request_sender(),
-            fetch_result_listeners: runner.get_fetch_result_listeners(),
+            fetch_request_sender: worker.get_fetch_request_sender(),
+            fetch_listeners: worker.get_fetch_listeners(),
         }
     }
 }
@@ -37,11 +34,11 @@ impl AccountFetcher for RemoteAccountFetcherClient {
     fn fetch_account_chain_snapshot(
         &self,
         pubkey: &Pubkey,
-    ) -> BoxFuture<AccountFetcherResult> {
+    ) -> BoxFuture<AccountFetcherResult<AccountChainSnapshotShared>> {
         let (should_request_fetch, receiver) = match self
-            .fetch_result_listeners
+            .fetch_listeners
             .write()
-            .expect("RwLock of RemoteAccountFetcherClient.fetch_result_listeners is poisoned")
+            .expect("RwLock of RemoteAccountFetcherClient.fetch_listeners is poisoned")
             .entry(*pubkey)
         {
             Entry::Vacant(entry) => {
@@ -56,7 +53,7 @@ impl AccountFetcher for RemoteAccountFetcherClient {
             }
         };
         if should_request_fetch {
-            if let Err(error) = self.request_sender.send(*pubkey) {
+            if let Err(error) = self.fetch_request_sender.send(*pubkey) {
                 return Box::pin(ready(Err(AccountFetcherError::SendError(
                     error,
                 ))));

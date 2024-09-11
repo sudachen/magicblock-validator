@@ -1,14 +1,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sleipnir_program::{
-    sleipnir_instruction::AccountModification, traits::AccountsRemover,
-};
+use sleipnir_accounts_api::InternalAccountProvider;
 use solana_rpc_client::rpc_client::SerializableTransaction;
 use solana_sdk::{
-    account::{Account, AccountSharedData},
-    pubkey::Pubkey,
-    signature::Signature,
+    account::AccountSharedData, pubkey::Pubkey, signature::Signature,
     transaction::Transaction,
 };
 
@@ -16,32 +12,11 @@ use crate::errors::AccountsResult;
 
 #[async_trait]
 pub trait ScheduledCommitsProcessor {
-    async fn process<
-        AC: AccountCommitter,
-        IAP: InternalAccountProvider,
-        AR: AccountsRemover,
-    >(
+    async fn process<AC: AccountCommitter, IAP: InternalAccountProvider>(
         &self,
         committer: &Arc<AC>,
         account_provider: &IAP,
-        accounts_remover: &AR,
     ) -> AccountsResult<()>;
-}
-
-pub trait InternalAccountProvider: Send + Sync {
-    fn has_account(&self, pubkey: &Pubkey) -> bool;
-    fn get_account(&self, pubkey: &Pubkey) -> Option<AccountSharedData>;
-    fn get_slot(&self) -> u64;
-}
-
-#[async_trait]
-pub trait AccountCloner {
-    async fn clone_account(
-        &self,
-        pubkey: &Pubkey,
-        account: Option<&Account>,
-        overrides: Option<AccountModification>,
-    ) -> AccountsResult<Vec<Signature>>;
 }
 
 #[derive(Clone)]
@@ -62,12 +37,13 @@ pub struct AccountCommittee {
     /// Only present if undelegation was requested.
     pub undelegation_request: Option<UndelegationRequest>,
 }
+
+#[derive(Debug)]
 pub struct CommitAccountsTransaction {
     /// The transaction that is running on chain to commit and possibly undelegate
     /// accounts.
     pub transaction: Transaction,
     /// Accounts that are undelegated as part of the transaction.
-    /// They need to be removed from our validator when the transaction completes.
     pub undelegated_accounts: Vec<Pubkey>,
 }
 
@@ -77,6 +53,7 @@ impl CommitAccountsTransaction {
     }
 }
 
+#[derive(Debug)]
 pub struct CommitAccountsPayload {
     /// The transaction that commits the accounts.
     /// None if no accounts need to be committed.
@@ -86,6 +63,7 @@ pub struct CommitAccountsPayload {
 }
 
 /// Same as [CommitAccountsPayload] but one that is actionable
+#[derive(Debug)]
 pub struct SendableCommitAccountsPayload {
     pub transaction: CommitAccountsTransaction,
     /// The pubkeys and data of the accounts that were committed.
@@ -105,7 +83,6 @@ pub struct PendingCommitTransaction {
     /// The signature of the transaction that was sent to chain.
     pub signature: Signature,
     /// The accounts that are undelegated on chain as part of this transaction.
-    /// They need to be removed from our validator when the transaction completes.
     pub undelegated_accounts: Vec<Pubkey>,
 }
 

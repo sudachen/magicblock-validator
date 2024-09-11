@@ -29,7 +29,7 @@ fn setup() -> (
         let cancellation_token = cancellation_token.clone();
         tokio::spawn(async move {
             worker
-                .start_fetch_request_listener(cancellation_token)
+                .start_fetch_request_processing(cancellation_token)
                 .await
         })
     };
@@ -48,24 +48,30 @@ async fn test_devnet_fetch_clock_multiple_times() {
     let future_clock1 = client.fetch_account_chain_snapshot(&key_sysvar_clock);
     // Start to fetch the clock immediately again, we should not have any reply yet from the first one
     let future_clock2 = client.fetch_account_chain_snapshot(&key_sysvar_clock);
-    // Wait for a few slots to happen on-chain
-    sleep(Duration::from_millis(3000)).await;
-    // Start to fetch the clock again, it should have changed on chain (and the first fetch should have finished)
-    let future_clock3 = client.fetch_account_chain_snapshot(&key_sysvar_clock);
-    // Await all results to be available
+    // Wait for the first fetch to finish
     let result_clock1 = future_clock1.await;
     let result_clock2 = future_clock2.await;
+    // Wait for a few slots to happen on-chain (for the clock to change value)
+    sleep(Duration::from_millis(1000)).await;
+    // Start to fetch the clock again, it should have changed on chain (and the first fetch should have finished)
+    let future_clock3 = client.fetch_account_chain_snapshot(&key_sysvar_clock);
+    let future_clock4 = client.fetch_account_chain_snapshot(&key_sysvar_clock);
+    // Wait for the second fetch to finish
     let result_clock3 = future_clock3.await;
+    let result_clock4 = future_clock4.await;
     // All should have succeeded
     assert!(result_clock1.is_ok());
     assert!(result_clock2.is_ok());
     assert!(result_clock3.is_ok());
-    // The first 2 fetch should get the same result, but the 3rd one should get a different clock
+    assert!(result_clock4.is_ok());
+    // The first 2 requests should get the same result, but the 3rd one should get a different clock
     let snapshot_clock1 = result_clock1.unwrap();
     let snapshot_clock2 = result_clock2.unwrap();
     let snapshot_clock3 = result_clock3.unwrap();
-    assert_eq!(snapshot_clock1, snapshot_clock2);
+    let snapshot_clock4 = result_clock4.unwrap();
     assert_ne!(snapshot_clock1, snapshot_clock3);
+    assert_eq!(snapshot_clock1, snapshot_clock2);
+    assert_eq!(snapshot_clock3, snapshot_clock4);
     // Cleanup everything correctly
     cancellation_token.cancel();
     assert!(worker_handle.await.is_ok());
