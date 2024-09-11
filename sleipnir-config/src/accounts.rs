@@ -11,6 +11,7 @@ use crate::errors::{ConfigError, ConfigResult};
 // AccountsConfig
 // -----------------
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountsConfig {
     #[serde(default)]
     pub remote: RemoteConfig,
@@ -85,10 +86,8 @@ pub enum LifecycleMode {
 // -----------------
 // CommitStrategy
 // -----------------
-// This is the lowest we found to pass the transactions through mainnet fairly
-// consistently
-const COMPUTE_UNIT_PRICE: u64 = 1_000_000; // 1 Lamport
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitStrategy {
     #[serde(default = "default_frequency_millis")]
     pub frequency_millis: u64,
@@ -103,7 +102,9 @@ fn default_frequency_millis() -> u64 {
 }
 
 fn default_compute_unit_price() -> u64 {
-    COMPUTE_UNIT_PRICE
+    // This is the lowest we found to pass the transactions through mainnet fairly
+    // consistently
+    1_000_000 // 1_000_000 micro-lamports == 1 Lamport
 }
 
 impl Default for CommitStrategy {
@@ -119,6 +120,7 @@ impl Default for CommitStrategy {
 // Payer
 // -----------------
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Payer {
     /// The payer init balance in lamports.
     /// Read it via [Self::try_init_lamports].
@@ -147,6 +149,7 @@ impl Payer {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllowedProgram {
     #[serde(
         deserialize_with = "pubkey_deserialize",
