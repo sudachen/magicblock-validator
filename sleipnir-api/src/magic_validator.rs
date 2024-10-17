@@ -62,7 +62,10 @@ use crate::{
     geyser_transaction_notify_listener::GeyserTransactionNotifyListener,
     init_geyser_service::{init_geyser_service, InitGeyserServiceConfig},
     ledger,
-    tickers::{init_commit_accounts_ticker, init_slot_ticker},
+    tickers::{
+        init_commit_accounts_ticker, init_slot_ticker,
+        init_system_metrics_ticker,
+    },
 };
 
 // -----------------
@@ -116,7 +119,7 @@ pub struct MagicValidator {
     accounts_manager: Arc<AccountsManager>,
     transaction_listener: GeyserTransactionNotifyListener,
     rpc_service: JsonRpcService,
-    _metrics_service: Option<MetricsService>,
+    _metrics: Option<(MetricsService, tokio::task::JoinHandle<()>)>,
     geyser_rpc_service: Arc<GeyserRpcService>,
     pubsub_config: PubsubConfig,
     pub transaction_status_sender: TransactionStatusSender,
@@ -175,14 +178,22 @@ impl MagicValidator {
             );
 
         let metrics_config = &config.validator_config.metrics;
-        let metrics_service = if metrics_config.enabled {
-            Some(
-                sleipnir_metrics::try_start_metrics_service(
-                    metrics_config.service.socket_addr(),
-                    token.clone(),
-                )
-                .map_err(ApiError::FailedToStartMetricsService)?,
+        let metrics = if metrics_config.enabled {
+            let metrics_service = sleipnir_metrics::try_start_metrics_service(
+                metrics_config.service.socket_addr(),
+                token.clone(),
             )
+            .map_err(ApiError::FailedToStartMetricsService)?;
+
+            let system_metrics_ticker = init_system_metrics_ticker(
+                Duration::from_secs(
+                    metrics_config.system_metrics_tick_interval_secs,
+                ),
+                &ledger,
+                token.clone(),
+            );
+
+            Some((metrics_service, system_metrics_ticker))
         } else {
             None
         };
@@ -266,7 +277,7 @@ impl MagicValidator {
             config: config.validator_config,
             exit,
             rpc_service,
-            _metrics_service: metrics_service,
+            _metrics: metrics,
             geyser_rpc_service,
             slot_ticker: None,
             commit_accounts_ticker: None,
