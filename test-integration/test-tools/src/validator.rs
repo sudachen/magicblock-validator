@@ -52,14 +52,23 @@ pub fn start_magic_block_validator_with_config(
 
 pub fn wait_for_validator(mut validator: Child, port: u16) -> Option<Child> {
     let mut count = 0;
+    let max_retries = if std::env::var("CI").is_ok() {
+        1500
+    } else {
+        75
+    };
     loop {
         if TcpStream::connect(format!("0.0.0.0:{}", port)).is_ok() {
             break Some(validator);
         }
         count += 1;
-        // 30 seconds
-        if count >= 75 {
-            eprintln!("Validator RPC on port {} failed to listen", port);
+        // ~180 seconds (~12 mins in CI)
+        if count >= max_retries {
+            eprintln!(
+                "Validator RPC on port {} failed to listen after {}secs",
+                port,
+                count as f32 * 2.5
+            );
             validator.kill().expect("Failed to kill validator");
             break None;
         }
