@@ -183,17 +183,26 @@ impl Default for CommitStrategy {
 pub struct Payer {
     /// The payer init balance in lamports.
     /// Read it via [Self::try_init_lamports].
-    init_lamports: Option<u64>,
+    pub init_lamports: Option<u64>,
+    /// The base fees to pay for the transactions.
+    pub base_fees: Option<u64>,
     /// The payer init balance in SOL.
     /// Read it via [Self::try_init_lamports].
     init_sol: Option<u64>,
 }
 
+pub struct PayerParams {
+    pub init_lamports: Option<u64>,
+    pub init_sol: Option<u64>,
+    pub base_fees: Option<u64>,
+}
+
 impl Payer {
-    pub fn new(init_lamports: Option<u64>, init_sol: Option<u64>) -> Self {
+    pub fn new(params: PayerParams) -> Self {
         Self {
-            init_lamports,
-            init_sol,
+            init_lamports: params.init_lamports,
+            init_sol: params.init_sol,
+            base_fees: params.base_fees,
         }
     }
     pub fn try_init_lamports(&self) -> ConfigResult<Option<u64>> {
