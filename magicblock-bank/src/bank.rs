@@ -188,6 +188,9 @@ pub struct Bank {
     /// A cache of signature statuses
     pub status_cache: Arc<RwLock<BankStatusCache>>,
 
+    // First path provided to accounts db (in our case it is always one)
+    pub accounts_path: PathBuf,
+
     // -----------------
     // Counters
     // -----------------
@@ -382,6 +385,11 @@ impl Bank {
         millis_per_slot: u64,
         identity_id: Pubkey,
     ) -> Self {
+        let accounts_path = accounts_paths
+            .first()
+            .expect("At least one accounts path is required")
+            .to_path_buf();
+
         let accounts_db = AccountsDb::new_with_config(
             &genesis_config.cluster_type,
             accounts_update_notifier,
@@ -389,7 +397,11 @@ impl Bank {
         );
 
         let accounts = Accounts::new(Arc::new(accounts_db));
-        let mut bank = Self::default_with_accounts(accounts, millis_per_slot);
+        let mut bank = Self::default_with_accounts(
+            accounts,
+            accounts_path,
+            millis_per_slot,
+        );
         bank.transaction_debug_keys = debug_keys;
         bank.runtime_config = runtime_config;
         bank.slot_status_notifier = slot_status_notifier;
@@ -428,6 +440,7 @@ impl Bank {
 
     pub(super) fn default_with_accounts(
         accounts: Accounts,
+        accounts_path: PathBuf,
         millis_per_slot: u64,
     ) -> Self {
         // NOTE: this was not part of the original implementation
@@ -444,8 +457,8 @@ impl Bank {
         };
 
         // Transaction expiration needs to be a fixed amount of time
-        // So we compute how many slot it takes for a transaction to expire
-        // Depending on how fast each slot is compute
+        // So we compute how many slots it takes for a transaction to expire
+        // Depending on how fast each slot is computed
         let max_age = DEFAULT_MS_PER_SLOT * MAX_RECENT_BLOCKHASHES as u64
             / millis_per_slot;
 
@@ -470,6 +483,7 @@ impl Bank {
             millis_per_slot,
             max_age,
             identity_id: Pubkey::default(),
+            accounts_path,
 
             // Counters
             transaction_count: AtomicU64::default(),

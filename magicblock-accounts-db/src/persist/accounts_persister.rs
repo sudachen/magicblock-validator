@@ -350,7 +350,8 @@ impl AccountsPersister {
     // -----------------
     pub fn load_most_recent_store(
         &self,
-    ) -> AccountsDbResult<AccountStorageEntry> {
+        max_slot: Slot,
+    ) -> AccountsDbResult<Option<(AccountStorageEntry, Slot)>> {
         let path = self
             .paths
             .first()
@@ -398,25 +399,34 @@ impl AccountsPersister {
                 }
             },
         );
-        let (file, slot, id) =
-            files
-                .first()
-                .ok_or(AccountsDbError::NoAccountsFileFoundInside(
-                    path.display().to_string(),
-                ))?;
+
+        let matching_file = {
+            let mut matching_file = None;
+            for (file, slot, id) in files {
+                if slot <= max_slot {
+                    matching_file.replace((file, slot, id));
+                    break;
+                }
+            }
+            matching_file
+        };
+        let Some((file, slot, id)) = matching_file else {
+            warn!(
+                "No storage found with slot <= {} inside {}",
+                max_slot,
+                path.display().to_string(),
+            );
+            return Ok(None);
+        };
 
         // Create a AccountStorageEntry from the file
-        let file_size = fs::metadata(file)?.len() as usize;
+        let file_size = fs::metadata(&file)?.len() as usize;
         let (append_vec, num_accounts) =
-            AppendVec::new_from_file(file, file_size, true)?;
+            AppendVec::new_from_file(&file, file_size, true)?;
         let accounts = AccountsFile::AppendVec(append_vec);
-        let storage = AccountStorageEntry::new_existing(
-            *slot,
-            *id,
-            accounts,
-            num_accounts,
-        );
-        Ok(storage)
+        let storage =
+            AccountStorageEntry::new_existing(slot, id, accounts, num_accounts);
+        Ok(Some((storage, slot)))
     }
 
     // -----------------
