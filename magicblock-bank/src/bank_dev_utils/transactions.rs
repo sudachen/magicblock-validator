@@ -1,37 +1,42 @@
-use std::collections::HashSet;
-
-use log::{debug, error, info, trace, warn};
-use magicblock_accounts_db::transaction_results::TransactionResults;
+use itertools::izip;
 use rayon::{
     iter::IndexedParallelIterator,
     prelude::{
         IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
     },
 };
-use solana_program_runtime::timings::ExecuteTimings;
 use solana_sdk::{
     account::Account,
     hash::Hash,
     instruction::{AccountMeta, Instruction},
-    message::Message,
+    message::{v0::LoadedAddresses, Message},
     native_token::LAMPORTS_PER_SOL,
     pubkey::Pubkey,
     rent::Rent,
     signature::Keypair,
     signer::Signer,
     stake_history::Epoch,
-    system_instruction, system_program, system_transaction, sysvar,
+    system_instruction, system_program, system_transaction,
     sysvar::{
-        clock, epoch_schedule, fees, last_restart_slot, recent_blockhashes,
-        rent,
+        self, clock, epoch_schedule, fees, last_restart_slot,
+        recent_blockhashes, rent,
     },
-    transaction::{SanitizedTransaction, Transaction},
+    transaction::{SanitizedTransaction, Transaction, TransactionError},
+};
+use solana_svm::{
+    transaction_commit_result::CommittedTransaction,
+    transaction_processor::ExecutionRecordingConfig,
+};
+use solana_timings::ExecuteTimings;
+use solana_transaction_status::{
+    map_inner_instructions, ConfirmedTransactionWithStatusMeta,
+    TransactionStatusMeta, TransactionWithStatusMeta,
+    VersionedTransactionWithStatusMeta,
 };
 
 use super::elfs;
 use crate::{
-    bank::{Bank, TransactionExecutionRecordingOpts},
-    transaction_results::TransactionBalancesSet,
+    bank::Bank, transaction_results::TransactionBalancesSet,
     LAMPORTS_PER_SIGNATURE,
 };
 
@@ -50,14 +55,15 @@ pub fn create_funded_account(bank: &Bank, lamports: Option<u64>) -> Keypair {
     });
 
     bank.store_account(
-        &account.pubkey(),
-        &Account {
+        account.pubkey(),
+        Account {
             lamports,
             data: vec![],
             owner: system_program::id(),
             executable: false,
             rent_epoch: Epoch::MAX,
-        },
+        }
+        .into(),
     );
 
     account
@@ -76,14 +82,15 @@ pub fn create_funded_accounts(
 
     accounts.par_iter().for_each(|account| {
         bank.store_account(
-            &account.pubkey(),
-            &Account {
+            account.pubkey(),
+            Account {
                 lamports,
                 data: vec![],
                 owner: system_program::id(),
                 executable: false,
                 rent_epoch: Epoch::MAX,
-            },
+            }
+            .into(),
         );
     });
 
@@ -167,7 +174,11 @@ pub fn create_noop_transaction(
     let message = Message::new(&[instruction], None);
     let transaction =
         Transaction::new(&[&funded_accounts[0]], message, recent_blockhash);
-    SanitizedTransaction::try_from_legacy_transaction(transaction).unwrap()
+    SanitizedTransaction::try_from_legacy_transaction(
+        transaction,
+        &Default::default(),
+    )
+    .unwrap()
 }
 
 fn create_noop_instruction(
@@ -205,7 +216,11 @@ pub fn create_solx_send_post_transaction(
     let transaction =
         Transaction::new(&[author, post], message, bank.last_blockhash());
     (
-        SanitizedTransaction::try_from_legacy_transaction(transaction).unwrap(),
+        SanitizedTransaction::try_from_legacy_transaction(
+            transaction,
+            &Default::default(),
+        )
+        .unwrap(),
         SolanaxPostAccounts {
             post: post.pubkey(),
             author: author.pubkey(),
@@ -248,7 +263,11 @@ pub fn create_sysvars_get_transaction(bank: &Bank) -> SanitizedTransaction {
         message,
         bank.last_blockhash(),
     );
-    SanitizedTransaction::try_from_legacy_transaction(transaction).unwrap()
+    SanitizedTransaction::try_from_legacy_transaction(
+        transaction,
+        &Default::default(),
+    )
+    .unwrap()
 }
 
 fn create_sysvars_get_instruction(
@@ -299,7 +318,11 @@ pub fn create_sysvars_from_account_transaction(
         message,
         bank.last_blockhash(),
     );
-    SanitizedTransaction::try_from_legacy_transaction(transaction).unwrap()
+    SanitizedTransaction::try_from_legacy_transaction(
+        transaction,
+        &Default::default(),
+    )
+    .unwrap()
 }
 
 fn create_sysvars_from_account_instruction(
@@ -333,76 +356,84 @@ fn create_sysvars_from_account_instruction(
 pub fn execute_transactions(
     bank: &Bank,
     txs: Vec<SanitizedTransaction>,
-) -> (TransactionResults, TransactionBalancesSet) {
+) -> (
+    Vec<Result<ConfirmedTransactionWithStatusMeta, TransactionError>>,
+    TransactionBalancesSet,
+) {
     let batch = bank.prepare_sanitized_batch(&txs);
-
     let mut timings = ExecuteTimings::default();
     let (transaction_results, transaction_balances) = bank
         .load_execute_and_commit_transactions(
             &batch,
             true,
-            TransactionExecutionRecordingOpts::recording_logs(),
+            ExecutionRecordingConfig::new_single_setting(true),
             &mut timings,
             None,
         );
 
-    trace!("{:#?}", txs);
-    trace!("{:#?}", transaction_results.execution_results);
-    trace!("{:#?}", transaction_balances);
+    let TransactionBalancesSet {
+        pre_balances,
+        post_balances,
+    } = transaction_balances.clone();
 
-    for res in transaction_results.execution_results.iter() {
-        if let Err(err) = res.flattened_result() {
-            error!(
-                "Error: {:?}, ({}) 😈",
-                err,
-                if res.was_executed() {
-                    "executed"
-                } else {
-                    "not executed"
-                },
-            );
-        } else if res.was_executed_successfully() {
-            info!(
-                "Executed {}",
-                if res.was_executed_successfully() {
-                    "successfully. 😀"
-                } else {
-                    "but failed! 😈"
+    let transaction_results = izip!(
+        txs.iter(),
+        transaction_results.into_iter(),
+        pre_balances.into_iter(),
+        post_balances.into_iter(),
+    )
+    .map(
+        |(tx, commit_result, pre_balances, post_balances): (
+            &SanitizedTransaction,
+            Result<CommittedTransaction, TransactionError>,
+            Vec<u64>,
+            Vec<u64>,
+        )| {
+            commit_result.map(|committed_tx| {
+                let CommittedTransaction {
+                    status,
+                    log_messages,
+                    inner_instructions,
+                    return_data,
+                    executed_units,
+                    fee_details,
+                    ..
+                } = committed_tx;
+
+                let inner_instructions =
+                    inner_instructions.map(|inner_instructions| {
+                        map_inner_instructions(inner_instructions).collect()
+                    });
+
+                let tx_status_meta = TransactionStatusMeta {
+                    status,
+                    fee: fee_details.total_fee(),
+                    pre_balances,
+                    post_balances,
+                    pre_token_balances: None,
+                    post_token_balances: None,
+                    inner_instructions,
+                    log_messages,
+                    rewards: None,
+                    loaded_addresses: LoadedAddresses::default(),
+                    return_data,
+                    compute_units_consumed: Some(executed_units),
+                };
+
+                ConfirmedTransactionWithStatusMeta {
+                    slot: bank.slot(),
+                    tx_with_meta: TransactionWithStatusMeta::Complete(
+                        VersionedTransactionWithStatusMeta {
+                            transaction: tx.to_versioned_transaction(),
+                            meta: tx_status_meta,
+                        },
+                    ),
+                    block_time: None,
                 }
-            );
-        } else {
-            warn!("Failed to execute 😈",);
-        }
-    }
-
-    for key in txs
-        .iter()
-        .flat_map(|tx| tx.message().account_keys().iter())
-        .collect::<HashSet<_>>()
-    {
-        if key.eq(&system_program::id()) {
-            continue;
-        }
-
-        if let Some(account) = bank.get_account(key) {
-            trace!("{:?}: {:#?}", key, account);
-        } else {
-            debug!("{:?}: missing", key);
-        }
-    }
-
-    info!("");
-    info!("=============== Logs ===============");
-    for res in transaction_results.execution_results.iter() {
-        if let Some(logs) =
-            res.details().as_ref().and_then(|x| x.log_messages.as_ref())
-        {
-            for log in logs {
-                info!("> {log}");
-            }
-        }
-    }
-    info!("");
+            })
+        },
+    )
+    .collect();
 
     (transaction_results, transaction_balances)
 }

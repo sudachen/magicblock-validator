@@ -420,7 +420,7 @@ fn process_undelegate_request(
         })?;
     undelegate_account(
         delegated_account,
-        &crate::id(),
+        &id(),
         buffer,
         payer,
         system_program,

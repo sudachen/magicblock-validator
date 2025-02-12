@@ -1,22 +1,21 @@
 use std::{collections::HashMap, sync::Arc};
 
-use magicblock_accounts_db::transaction_results::TransactionResults;
 use magicblock_bank::{
-    bank::{Bank, TransactionExecutionRecordingOpts},
-    genesis_utils::create_genesis_config_with_leader_and_fees,
+    bank::Bank, genesis_utils::create_genesis_config_with_leader_and_fees,
 };
-use solana_program_runtime::timings::ExecuteTimings;
 use solana_sdk::{
     pubkey::Pubkey,
     transaction::{SanitizedTransaction, Transaction},
 };
+use solana_svm::transaction_processor::ExecutionRecordingConfig;
+use solana_timings::ExecuteTimings;
 
 use crate::{
     bank::bank_for_tests,
     traits::{TransactionsProcessor, TransactionsProcessorProcessResult},
 };
 
-#[derive(Debug)]
+//#[derive(Debug)]
 pub struct BankTransactionsProcessor {
     pub bank: Arc<Bank>,
 }
@@ -63,27 +62,23 @@ impl TransactionsProcessor for BankTransactionsProcessor {
             let txs = vec![transaction.clone()];
             let batch = self.bank.prepare_sanitized_batch(&txs);
             let mut timings = ExecuteTimings::default();
-            let (
-                TransactionResults {
-                    execution_results, ..
-                },
-                _,
-            ) = self.bank.load_execute_and_commit_transactions(
-                &batch,
-                true,
-                TransactionExecutionRecordingOpts::recording_logs(),
-                &mut timings,
-                None,
-            );
+            let (commit_results, _) =
+                self.bank.load_execute_and_commit_transactions(
+                    &batch,
+                    true,
+                    ExecutionRecordingConfig::new_single_setting(true),
+                    &mut timings,
+                    None,
+                );
 
-            let execution_result = execution_results
+            let execution_result = commit_results
                 .first()
                 .expect("Could not find the transaction result");
-            let execution_details = match execution_result.details() {
-                Some(details) => details.clone(),
-                None => panic!(
+            let execution_details = match execution_result {
+                Ok(details) => details.clone(),
+                Err(err) => panic!(
                     "Error resolving transaction results details: {:?}, tx: {:?}",
-                    execution_result, transaction
+                    err, transaction
                 ),
             };
 

@@ -119,10 +119,17 @@ impl From<(u64, Option<u64>, SlotStatus)> for MessageSlot {
         Self {
             slot,
             parent,
+            // this BS is pretty much irrelevant in ER
             status: match status {
-                SlotStatus::Processed => CommitmentLevel::Processed,
-                SlotStatus::Confirmed => CommitmentLevel::Confirmed,
-                SlotStatus::Rooted => CommitmentLevel::Finalized,
+                SlotStatus::Processed | SlotStatus::FirstShredReceived => {
+                    CommitmentLevel::Processed
+                }
+                SlotStatus::Confirmed | SlotStatus::CreatedBank => {
+                    CommitmentLevel::Confirmed
+                }
+                SlotStatus::Rooted
+                | SlotStatus::Completed
+                | SlotStatus::Dead(_) => CommitmentLevel::Finalized,
             },
         }
     }
@@ -608,6 +615,8 @@ impl BlockMetaStorage {
     ) -> Result<CommitmentLevel, Status> {
         let commitment =
             commitment.unwrap_or(CommitmentLevel::Processed as i32);
+        // the `from` verion potentially panics
+        #[allow(clippy::unnecessary_fallible_conversions)]
         CommitmentLevel::try_from(commitment).map_err(|_error| {
             let msg =
                 format!("failed to create CommitmentLevel from {commitment:?}");

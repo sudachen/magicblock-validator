@@ -27,11 +27,11 @@ use magicblock_accounts::{
     utils::try_rpc_cluster_from_cluster, AccountsManager,
 };
 use magicblock_accounts_api::BankAccountProvider;
+use magicblock_accounts_db::geyser::AccountsUpdateNotifier;
 use magicblock_bank::{
     bank::Bank, genesis_utils::create_genesis_config_with_leader,
-    program_loader::load_programs_into_bank,
+    geyser::TransactionNotifier, program_loader::load_programs_into_bank,
     transaction_logs::TransactionLogCollectorFilter,
-    transaction_notifier_interface::TransactionNotifierArc,
 };
 use magicblock_config::{EphemeralConfig, ProgramConfig};
 use magicblock_geyser_plugin::rpc::GeyserRpcService;
@@ -48,7 +48,10 @@ use magicblock_rpc::{
 use magicblock_transaction_status::{
     TransactionStatusMessage, TransactionStatusSender,
 };
-use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService;
+use solana_geyser_plugin_manager::{
+    geyser_plugin_manager::GeyserPluginManager,
+    slot_status_notifier::SlotStatusNotifierImpl,
+};
 use solana_sdk::{
     commitment_config::CommitmentLevel, genesis_config::GenesisConfig,
     pubkey::Pubkey, signature::Keypair, signer::Signer,
@@ -146,6 +149,7 @@ impl MagicValidator {
 
         let (geyser_service, geyser_rpc_service) =
             init_geyser_service(config.init_geyser_service_config)?;
+        let geyser_manager = Arc::new(RwLock::new(geyser_service));
 
         let validator_pubkey = identity_keypair.pubkey();
         let magicblock_bank::genesis_utils::GenesisConfigInfo {
@@ -167,7 +171,7 @@ impl MagicValidator {
 
         let exit = Arc::<AtomicBool>::default();
         let bank = Self::init_bank(
-            &geyser_service,
+            Some(geyser_manager.clone()),
             &genesis_config,
             config.validator_config.validator.millis_per_slot,
             validator_pubkey,
@@ -193,7 +197,7 @@ impl MagicValidator {
         let (transaction_sndr, transaction_listener) =
             Self::init_transaction_listener(
                 &ledger,
-                geyser_service.get_transaction_notifier(),
+                Some(TransactionNotifier::new(geyser_manager)),
             );
 
         let metrics_config = &config.validator_config.metrics;
@@ -333,7 +337,7 @@ impl MagicValidator {
     }
 
     fn init_bank(
-        geyser_service: &GeyserPluginService,
+        geyser_manager: Option<Arc<RwLock<GeyserPluginManager>>>,
         genesis_config: &GenesisConfig,
         millis_per_slot: u64,
         validator_pubkey: Pubkey,
@@ -347,8 +351,8 @@ impl MagicValidator {
             None,
             false,
             accounts_paths,
-            geyser_service.get_accounts_update_notifier(),
-            geyser_service.get_slot_status_notifier(),
+            geyser_manager.clone().map(AccountsUpdateNotifier::new),
+            geyser_manager.map(SlotStatusNotifierImpl::new),
             millis_per_slot,
             validator_pubkey,
         );
@@ -477,7 +481,7 @@ impl MagicValidator {
 
     fn init_transaction_listener(
         ledger: &Arc<Ledger>,
-        transaction_notifier: Option<TransactionNotifierArc>,
+        transaction_notifier: Option<TransactionNotifier>,
     ) -> (
         crossbeam_channel::Sender<TransactionStatusMessage>,
         GeyserTransactionNotifyListener,
@@ -543,7 +547,7 @@ impl MagicValidator {
     pub async fn start(&mut self) -> ApiResult<()> {
         self.maybe_process_ledger()?;
 
-        self.transaction_listener.run(true);
+        self.transaction_listener.run(true, self.bank.clone());
 
         self.slot_ticker = Some(init_slot_ticker(
             &self.bank,

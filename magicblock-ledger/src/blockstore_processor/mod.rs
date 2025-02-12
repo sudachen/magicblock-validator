@@ -2,11 +2,12 @@ use std::str::FromStr;
 
 use log::{Level::Trace, *};
 use magicblock_accounts_db::{
-    transaction_results::TransactionExecutionResult, AccountsPersister,
+    utils::{all_accounts, StoredAccountMeta},
+    AccountsPersister,
 };
-use magicblock_bank::bank::{Bank, TransactionExecutionRecordingOpts};
-use solana_program_runtime::timings::ExecuteTimings;
+use magicblock_bank::bank::Bank;
 use solana_sdk::{
+    account::{Account, AccountSharedData, ReadableAccount},
     clock::{Slot, UnixTimestamp},
     hash::Hash,
     message::SanitizedMessage,
@@ -14,6 +15,13 @@ use solana_sdk::{
         SanitizedTransaction, TransactionVerificationMode, VersionedTransaction,
     },
 };
+use solana_svm::{
+    transaction_commit_result::{
+        TransactionCommitResult, TransactionCommitResultExtensions,
+    },
+    transaction_processor::ExecutionRecordingConfig,
+};
+use solana_timings::ExecuteTimings;
 use solana_transaction_status::VersionedConfirmedBlock;
 
 use crate::{
@@ -114,14 +122,19 @@ fn hydrate_bank(bank: &Bank, max_slot: Slot) -> LedgerResult<(Slot, usize)> {
     else {
         return Ok((0, 0));
     };
-    let all_accounts = storage.all_accounts();
-    let len = all_accounts.len();
-    let storable_accounts = all_accounts
-        .iter()
-        .map(|acc| (acc.pubkey(), acc))
-        .collect::<Vec<_>>();
-    bank.store_accounts((slot, &storable_accounts[..]));
-
+    let storable_accounts =
+        all_accounts(&storage, |acc_meta: StoredAccountMeta| {
+            let acc = Account {
+                lamports: acc_meta.lamports(),
+                rent_epoch: acc_meta.rent_epoch(),
+                owner: *acc_meta.owner(),
+                executable: acc_meta.executable(),
+                data: acc_meta.data().to_vec(),
+            };
+            (*acc_meta.pubkey(), AccountSharedData::from(acc))
+        });
+    let len = storable_accounts.len();
+    bank.store_accounts(storable_accounts);
     Ok((slot, len))
 }
 
@@ -199,16 +212,14 @@ pub fn process_ledger(ledger: &Ledger, bank: &Bank) -> LedgerResult<u64> {
                         .load_execute_and_commit_transactions(
                             &batch,
                             false,
-                            TransactionExecutionRecordingOpts::recording_logs(),
+                            ExecutionRecordingConfig::new_single_setting(true),
                             &mut timings,
                             None,
                         );
 
-                    log_execution_results(&results.execution_results);
-                    for result in results.execution_results {
-                        if let TransactionExecutionResult::NotExecuted(err) =
-                            &result
-                        {
+                    log_execution_results(&results);
+                    for result in results {
+                        if !result.was_executed_successfully() {
                             // If we're on trace log level then we already logged this above
                             if !log_enabled!(Trace) {
                                 debug!(
@@ -217,11 +228,18 @@ pub fn process_ledger(ledger: &Ledger, bank: &Bank) -> LedgerResult<u64> {
                                 );
                                 debug!("Result: {:#?}", result);
                             }
+                            let err = match &result {
+                                Ok(tx) => match &tx.status {
+                                    Ok(_) => None,
+                                    Err(err) => Some(err),
+                                },
+                                Err(err) => Some(err),
+                            };
                             return Err(LedgerError::BlockStoreProcessor(
                                 format!(
-                            "Transaction {:?} could not be executed: {:?}",
-                            result, err
-                        ),
+                                    "Transaction {:?} could not be executed: {:?}",
+                                    result, err
+                                ),
                             ));
                         }
                     }
@@ -259,17 +277,25 @@ instructions: {:?}
     }
 }
 
-fn log_execution_results(results: &[TransactionExecutionResult]) {
+fn log_execution_results(results: &[TransactionCommitResult]) {
     if !log_enabled!(Trace) {
         return;
     }
     for result in results {
         match result {
-            TransactionExecutionResult::Executed { details, .. } => {
-                trace!("Executed: {:#?}", details);
+            Ok(tx) => {
+                if result.was_executed_successfully() {
+                    trace!(
+                        "Executed: (fees: {:#?}, loaded accounts; {:#?})",
+                        tx.fee_details,
+                        tx.loaded_account_stats
+                    );
+                } else {
+                    trace!("NotExecuted: {:#?}", tx.status);
+                }
             }
-            TransactionExecutionResult::NotExecuted(err) => {
-                trace!("NotExecuted: {:#?}", err);
+            Err(err) => {
+                trace!("Failed: {:#?}", err);
             }
         }
     }

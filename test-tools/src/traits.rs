@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 
-use magicblock_accounts_db::transaction_results::TransactionExecutionDetails;
 use magicblock_bank::bank::Bank;
 use solana_sdk::{
     signature::Signature,
     transaction::{SanitizedTransaction, Transaction},
 };
+use solana_svm::transaction_commit_result::CommittedTransaction;
 
 #[derive(Default, Debug)]
 pub struct TransactionsProcessorProcessResult {
     pub transactions:
-        HashMap<Signature, (SanitizedTransaction, TransactionExecutionDetails)>,
+        HashMap<Signature, (SanitizedTransaction, CommittedTransaction)>,
 }
 
 impl TransactionsProcessorProcessResult {

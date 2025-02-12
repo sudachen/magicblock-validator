@@ -337,12 +337,13 @@ pub mod convert_from {
         transaction_context::TransactionReturnData,
     };
     use solana_transaction_status::{
-        ConfirmedBlock, InnerInstruction, InnerInstructions, Reward,
-        RewardType, TransactionStatusMeta, TransactionTokenBalance,
+        ConfirmedBlock, InnerInstruction, InnerInstructions,
+        TransactionStatusMeta, TransactionTokenBalance,
         TransactionWithStatusMeta, VersionedTransactionWithStatusMeta,
     };
 
     use super::prelude as proto;
+    use crate::geyser::CommitmentLevel;
 
     fn ensure_some<T>(
         maybe_value: Option<T>,
@@ -362,19 +363,12 @@ pub mod convert_from {
             transactions.push(create_tx_with_meta(tx)?);
         }
 
-        let mut rewards = vec![];
-        for reward in
-            ensure_some(block.rewards, "failed to get rewards")?.rewards
-        {
-            rewards.push(create_reward(reward)?);
-        }
-
         Ok(ConfirmedBlock {
             previous_blockhash: block.parent_blockhash,
             blockhash: block.blockhash,
             parent_slot: block.parent_slot,
             transactions,
-            rewards,
+            rewards: Vec::new(),
             block_time: Some(ensure_some(
                 block.block_time.map(|wrapper| wrapper.timestamp),
                 "failed to get block_time",
@@ -383,6 +377,7 @@ pub mod convert_from {
                 block.block_height.map(|wrapper| wrapper.block_height),
                 "failed to get block_height",
             )?),
+            num_partitions: None,
         })
     }
 
@@ -514,11 +509,6 @@ pub mod convert_from {
             Some(err) => Err(err),
             None => Ok(()),
         };
-        let meta_rewards = meta
-            .rewards
-            .into_iter()
-            .map(create_reward)
-            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(TransactionStatusMeta {
             status: meta_status,
@@ -535,7 +525,8 @@ pub mod convert_from {
             post_token_balances: Some(create_token_balances(
                 meta.post_token_balances,
             )?),
-            rewards: Some(meta_rewards),
+            // NOTE: we don't support rewards
+            rewards: None,
             loaded_addresses: create_loaded_addresses(
                 meta.loaded_writable_addresses,
                 meta.loaded_readonly_addresses,
@@ -597,32 +588,6 @@ pub mod convert_from {
                 "failed to decode InnerInstructions.index",
             )?,
             instructions,
-        })
-    }
-
-    pub fn create_reward(reward: proto::Reward) -> Result<Reward, String> {
-        Ok(Reward {
-            pubkey: reward.pubkey,
-            lamports: reward.lamports,
-            post_balance: reward.post_balance,
-            reward_type: match ensure_some(
-                proto::RewardType::try_from(reward.reward_type).ok(),
-                "failed to parse reward_type",
-            )? {
-                proto::RewardType::Unspecified => None,
-                proto::RewardType::Fee => Some(RewardType::Fee),
-                proto::RewardType::Rent => Some(RewardType::Rent),
-                proto::RewardType::Staking => Some(RewardType::Staking),
-                proto::RewardType::Voting => Some(RewardType::Voting),
-            },
-            commission: if reward.commission.is_empty() {
-                None
-            } else {
-                Some(ensure_some(
-                    reward.commission.parse().ok(),
-                    "failed to parse reward commission",
-                )?)
-            },
         })
     }
 
@@ -692,5 +657,11 @@ pub mod convert_from {
             rent_epoch: account.rent_epoch,
         };
         Ok((pubkey, account))
+    }
+    impl From<i32> for CommitmentLevel {
+        fn from(value: i32) -> Self {
+            Self::from_i32(value)
+                .expect("failed to convert i32 to CommitmentLevel")
+        }
     }
 }

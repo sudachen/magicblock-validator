@@ -10,24 +10,36 @@ edition.workspace = true
 [dependencies]
 bincode = { workspace = true }
 env_logger = { workspace = true, optional = true }
+itertools = { workspace = true, optional = true }
 log = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true, optional = true }
 serde = { workspace = true, features = ["rc"] }
 magicblock-accounts-db = { workspace = true }
 magicblock-program = { workspace = true }
+solana-accounts-db = { workspace = true }
 solana-address-lookup-table-program = { workspace = true }
 solana-bpf-loader-program = { workspace = true }
+solana-compute-budget = { version = "2.1.11" }
 solana-compute-budget-program = { workspace = true }
 solana-cost-model = { workspace = true }
+solana-geyser-plugin-interface = { workspace = true }
+solana-geyser-plugin-manager = { workspace = true }
+solana-fee = "2.1.11"
 solana-frozen-abi-macro = { workspace = true }
 solana-loader-v4-program = { workspace = true }
+solana-inline-spl = "2.1.11"
 solana-measure = { workspace = true }
 solana-program-runtime = { workspace = true }
+solana-rpc = { workspace = true }
+solana-runtime-transaction = "2.1.11"
 solana-sdk = { workspace = true }
 solana-svm = { workspace = true }
+solana-svm-transaction = { workspace = true }
 solana-system-program = { workspace = true }
+solana-timings = { workspace = true }
 solana-transaction-status = { workspace = true }
+
 
 [dev-dependencies]
 assert_matches = { workspace = true }
@@ -40,7 +52,7 @@ solana-sdk = { workspace = true, features = ["dev-context-only-utils"] }
 test-tools-core = { workspace = true }
 
 [features]
-dev-context-only-utils = ["rayon", "env_logger"]
+dev-context-only-utils = ["rayon", "env_logger", "itertools"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

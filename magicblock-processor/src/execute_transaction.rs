@@ -18,7 +18,10 @@ pub fn execute_legacy_transaction(
     bank: &Arc<Bank>,
     transaction_status_sender: Option<&TransactionStatusSender>,
 ) -> Result<Signature> {
-    let sanitized_tx = SanitizedTransaction::try_from_legacy_transaction(tx)?;
+    let sanitized_tx = SanitizedTransaction::try_from_legacy_transaction(
+        tx,
+        &Default::default(),
+    )?;
     execute_sanitized_transaction(sanitized_tx, bank, transaction_status_sender)
 }
 
@@ -54,7 +57,7 @@ pub fn execute_sanitized_transaction(
         // TODO: figure out how to properly derive transaction_indexes (index within the slot)
         // - This is important for the ledger history of each slot
         // - tracked: https://github.com/magicblock-labs/magicblock-validator/issues/201
-        transaction_slot_indexes: txs
+        transaction_indexes: txs
             .iter()
             .map(|_| {
                 *transaction_index_locked += 1;

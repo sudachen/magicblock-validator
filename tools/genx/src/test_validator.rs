@@ -1,6 +1,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use ledger_stats::{accounts_storage_from_ledger, open_ledger};
+use magicblock_accounts_db::utils::all_accounts;
+use solana_sdk::pubkey::Pubkey;
 use tempfile::tempdir;
 
 pub struct TestValidatorConfig {
@@ -15,18 +17,14 @@ pub(crate) fn gen_test_validator_start_script(
     let temp_dir = tempdir().expect("Failed to create temporary directory");
     let temp_dir_path = temp_dir.into_path();
     let file_path = temp_dir_path.join("run-validator.sh");
-    let accounts = if let Some(ledger_path) = ledger_path {
+    let accounts: Vec<Pubkey> = if let Some(ledger_path) = ledger_path {
         let ledger = open_ledger(ledger_path);
         eprintln!(
             "Generating test validator script with accounts from ledger: {:?}",
             ledger_path
         );
         let (storage, _) = accounts_storage_from_ledger(&ledger);
-        storage
-            .all_accounts()
-            .into_iter()
-            .map(|x| *x.pubkey())
-            .collect::<Vec<_>>()
+        all_accounts(&storage, |x| *x.pubkey())
     } else {
         eprintln!("Generating test validator script without accounts");
         vec![]

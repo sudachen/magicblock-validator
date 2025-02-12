@@ -2,10 +2,9 @@
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use magicblock_accounts_db::{
-    accounts::Accounts, accounts_db::AccountsDb,
-    accounts_update_notifier_interface::AccountsUpdateNotifier,
+    accounts::Accounts, accounts_db::AccountsDb, geyser::AccountsUpdateNotifier,
 };
-use solana_program_runtime::timings::ExecuteTimings;
+use solana_geyser_plugin_manager::slot_status_notifier::SlotStatusNotifierImpl;
 use solana_sdk::{
     genesis_config::GenesisConfig,
     pubkey::Pubkey,
@@ -14,11 +13,14 @@ use solana_sdk::{
         VersionedTransaction,
     },
 };
-use solana_svm::runtime_config::RuntimeConfig;
+use solana_svm::{
+    runtime_config::RuntimeConfig,
+    transaction_commit_result::TransactionCommitResult,
+};
+use solana_timings::ExecuteTimings;
 
 use crate::{
-    bank::Bank, slot_status_notifier_interface::SlotStatusNotifierArc,
-    transaction_batch::TransactionBatch,
+    bank::Bank, transaction_batch::TransactionBatch,
     transaction_logs::TransactionLogCollectorFilter,
     EPHEM_DEFAULT_MILLIS_PER_SLOT,
 };
@@ -38,7 +40,7 @@ impl Bank {
     pub fn new_for_tests(
         genesis_config: &GenesisConfig,
         accounts_update_notifier: Option<AccountsUpdateNotifier>,
-        slot_status_notifier: Option<SlotStatusNotifierArc>,
+        slot_status_notifier: Option<SlotStatusNotifierImpl>,
     ) -> Self {
         Self::new_with_config_for_tests(
             genesis_config,
@@ -53,7 +55,7 @@ impl Bank {
         genesis_config: &GenesisConfig,
         runtime_config: Arc<RuntimeConfig>,
         accounts_update_notifier: Option<AccountsUpdateNotifier>,
-        slot_status_notifier: Option<SlotStatusNotifierArc>,
+        slot_status_notifier: Option<SlotStatusNotifierImpl>,
         millis_per_slot: u64,
     ) -> Self {
         let account_paths = vec![PathBuf::default()];
@@ -103,7 +105,7 @@ impl Bank {
     pub fn process_transactions<'a>(
         &self,
         txs: impl Iterator<Item = &'a Transaction>,
-    ) -> Vec<Result<()>> {
+    ) -> Vec<TransactionCommitResult> {
         self.try_process_transactions(txs).unwrap()
     }
 
@@ -116,7 +118,7 @@ impl Bank {
     pub fn process_entry_transactions(
         &self,
         txs: Vec<VersionedTransaction>,
-    ) -> Vec<Result<()>> {
+    ) -> Vec<TransactionCommitResult> {
         self.try_process_entry_transactions(txs).unwrap()
     }
 
@@ -134,7 +136,7 @@ impl Bank {
     pub fn try_process_transactions<'a>(
         &self,
         txs: impl Iterator<Item = &'a Transaction>,
-    ) -> Result<Vec<Result<()>>> {
+    ) -> Result<Vec<TransactionCommitResult>> {
         let txs = txs
             .map(|tx| VersionedTransaction::from(tx.clone()))
             .collect();
@@ -146,7 +148,7 @@ impl Bank {
     pub fn try_process_entry_transactions(
         &self,
         txs: Vec<VersionedTransaction>,
-    ) -> Result<Vec<Result<()>>> {
+    ) -> Result<Vec<TransactionCommitResult>> {
         let batch = self.prepare_entry_batch(txs)?;
         Ok(self.process_transaction_batch(&batch))
     }
@@ -165,6 +167,7 @@ impl Bank {
                     MessageHash::Compute,
                     None,
                     self,
+                    &Default::default(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -184,7 +187,7 @@ impl Bank {
     pub(super) fn process_transaction_batch(
         &self,
         batch: &TransactionBatch,
-    ) -> Vec<Result<()>> {
+    ) -> Vec<TransactionCommitResult> {
         self.load_execute_and_commit_transactions(
             batch,
             false,
@@ -193,6 +196,5 @@ impl Bank {
             None,
         )
         .0
-        .fee_collection_results
     }
 }

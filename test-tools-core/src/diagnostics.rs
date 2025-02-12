@@ -1,7 +1,7 @@
 use std::{env, path::Path};
 
-use log::info;
-use magicblock_accounts_db::transaction_results::TransactionExecutionDetails;
+use log::{error, info};
+use solana_svm::transaction_commit_result::CommittedTransaction;
 
 // -----------------
 // init_logger
@@ -41,10 +41,18 @@ macro_rules! init_logger {
 // -----------------
 // Solana Logs
 // -----------------
-pub fn log_exec_details(transaction_results: &TransactionExecutionDetails) {
+pub fn log_exec_details(transaction_results: &CommittedTransaction) {
     info!("");
     info!("=============== Logs ===============");
-    if let Some(logs) = transaction_results.log_messages.as_ref() {
+    let logs = match &transaction_results.status {
+        Ok(_) => &transaction_results.log_messages,
+        Err(error) => {
+            error!("error executing transaction: {error}");
+            return;
+        }
+    };
+
+    if let Some(logs) = logs {
         for log in logs {
             info!("> {log}");
         }

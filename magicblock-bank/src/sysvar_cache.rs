@@ -1,39 +1,30 @@
 // NOTE: copied from bank/sysvar_cache.rs and tests removed
 use solana_program_runtime::sysvar_cache::SysvarCache;
-use solana_sdk::{account::ReadableAccount, clock::Clock};
+use solana_sdk::clock::Clock;
 
 use super::bank::Bank;
 
 impl Bank {
     pub(crate) fn fill_missing_sysvar_cache_entries(&self) {
         let tx_processor = self.transaction_processor.read().unwrap();
-        let mut sysvar_cache = tx_processor.sysvar_cache.write().unwrap();
-        sysvar_cache.fill_missing_entries(|pubkey, callback| {
-            if let Some(account) = self.get_account_with_fixed_root(pubkey) {
-                callback(account.data());
-            }
-        });
+        tx_processor.fill_missing_sysvar_cache_entries(self);
     }
 
     pub(crate) fn set_clock_in_sysvar_cache(&self, clock: Clock) {
-        let tx_processor = self.transaction_processor.read().unwrap();
-        tx_processor.sysvar_cache.write().unwrap().set_clock(clock);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn reset_sysvar_cache(&self) {
-        let tx_processor = self.transaction_processor.read().unwrap();
-        let mut sysvar_cache = tx_processor.sysvar_cache.write().unwrap();
-        sysvar_cache.reset();
-    }
-
-    pub fn get_sysvar_cache_for_tests(&self) -> SysvarCache {
-        self.transaction_processor
-            .read()
-            .unwrap()
-            .sysvar_cache
-            .read()
-            .unwrap()
-            .clone()
+        #[allow(clippy::readonly_write_lock)]
+        let tx_processor = self.transaction_processor.write().unwrap();
+        // TODO(bmuddha): get rid of this ugly hack
+        // context: we cannot get a &mut to inner SysvarCache as it's
+        // private and there's no way to set clock variable directly besides
+        // the `fill_missing_sysvar_cache_entries` which is quite expensive
+        //
+        // ugly hack: this is formally a vialotion of rust's aliasing rules (UB),
+        // but we have just acquired an exclusive lock, and thus it's guaranteed
+        // that no other thread is reading the sysvar_cache, so we can mutate it
+        // SAFETY: trust me, I know what I'm doing
+        let ptr = (&*tx_processor.sysvar_cache()) as *const SysvarCache
+            as *mut SysvarCache;
+        #[allow(invalid_reference_casting)]
+        unsafe { &mut *ptr }.set_sysvar_for_tests(&clock);
     }
 }

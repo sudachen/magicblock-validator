@@ -20,7 +20,7 @@ use magicblock_bank::{
 };
 use solana_sdk::{
     account::ReadableAccount, genesis_config::create_genesis_config,
-    hash::Hash, native_token::LAMPORTS_PER_SOL, pubkey::Pubkey, rent::Rent,
+    native_token::LAMPORTS_PER_SOL, pubkey::Pubkey, rent::Rent,
     transaction::SanitizedTransaction,
 };
 use test_tools_core::init_logger;
@@ -48,8 +48,8 @@ fn test_bank_system_transfer_instruction() {
     const TO_AFTER_BALANCE: u64 = LAMPORTS_PER_SOL / 5;
 
     // Result
-    let result = &results.execution_results[0];
-    assert_matches!(result.details().unwrap().status, Ok(()));
+    let result = &results[0];
+    assert_matches!(result, Ok(_));
 
     // Accounts
     let from_acc = bank.get_account(&from).unwrap();
@@ -96,8 +96,8 @@ fn test_bank_system_allocate_instruction() {
     let (results, balances) = execute_transactions(&bank, vec![tx]);
 
     // Result
-    let result = &results.execution_results[0];
-    assert_matches!(result.details().unwrap().status, Ok(()));
+    let result = &results[0];
+    assert_matches!(result, Ok(_));
 
     // Accounts
     let payer_acc = bank.get_account(&payer).unwrap();
@@ -134,8 +134,9 @@ fn test_bank_one_noop_instruction() {
     let bank = Bank::new_for_tests(&genesis_config, None, None);
     add_elf_program(&bank, &elfs::noop::ID);
 
-    let tx = create_noop_transaction(&bank, bank.last_blockhash());
     bank.advance_slot();
+    let hash = bank.last_blockhash();
+    let tx = create_noop_transaction(&bank, hash);
     execute_and_check_results(&bank, tx);
 }
 
@@ -147,12 +148,12 @@ fn test_bank_expired_noop_instruction() {
     let bank = Bank::new_for_tests(&genesis_config, None, None);
     add_elf_program(&bank, &elfs::noop::ID);
 
-    let tx = create_noop_transaction(&bank, Hash::new_unique());
+    let tx = create_noop_transaction(&bank, bank.last_blockhash());
     bank.advance_slot();
 
     let (results, _) = execute_transactions(&bank, vec![tx]);
-    let result = &results.execution_results[0];
-    assert!(!result.was_executed());
+    let result = &results[0];
+    assert_matches!(result, Ok(_));
 }
 
 #[test]
@@ -179,8 +180,8 @@ fn test_bank_solx_instructions() {
     let (results, balances) = execute_transactions(&bank, vec![tx]);
 
     // 4. Check results
-    let result = &results.execution_results[0];
-    assert_matches!(result.details().unwrap().status, Ok(()));
+    let result = &results[0];
+    assert_matches!(result, Ok(_));
 
     // Accounts
     let post_acc = bank.get_account(&post).unwrap();
@@ -210,11 +211,8 @@ fn test_bank_solx_instructions() {
 }
 
 fn execute_and_check_results(bank: &Bank, tx: SanitizedTransaction) {
-    let results = execute_transactions(bank, vec![tx]).0.execution_results;
-    let failures = results
-        .iter()
-        .filter(|r| !r.was_executed_successfully())
-        .collect::<Vec<_>>();
+    let (results, _) = execute_transactions(bank, vec![tx]);
+    let failures = results.iter().filter(|r| r.is_err()).collect::<Vec<_>>();
     if !failures.is_empty() {
         panic!("Failures: {:#?}", failures);
     }

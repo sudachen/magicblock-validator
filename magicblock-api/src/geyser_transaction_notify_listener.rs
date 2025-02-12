@@ -2,24 +2,25 @@ use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use itertools::izip;
-use magicblock_accounts_db::transaction_results::TransactionExecutionDetails;
-use magicblock_bank::transaction_notifier_interface::TransactionNotifierArc;
+use magicblock_bank::{bank::Bank, geyser::TransactionNotifier};
 use magicblock_ledger::Ledger;
 use magicblock_metrics::metrics;
 use magicblock_transaction_status::{
     extract_and_fmt_memos, map_inner_instructions, TransactionStatusBatch,
     TransactionStatusMessage, TransactionStatusMeta,
 };
+use solana_rpc::transaction_notifier_interface::TransactionNotifier as _;
+use solana_svm::transaction_commit_result::CommittedTransaction;
 
 pub struct GeyserTransactionNotifyListener {
-    transaction_notifier: Option<TransactionNotifierArc>,
+    transaction_notifier: Option<TransactionNotifier>,
     transaction_recvr: Receiver<TransactionStatusMessage>,
     ledger: Arc<Ledger>,
 }
 
 impl GeyserTransactionNotifyListener {
     pub fn new(
-        transaction_notifier: Option<TransactionNotifierArc>,
+        transaction_notifier: Option<TransactionNotifier>,
         transaction_recvr: Receiver<TransactionStatusMessage>,
         ledger: Arc<Ledger>,
     ) -> Self {
@@ -30,9 +31,13 @@ impl GeyserTransactionNotifyListener {
         }
     }
 
-    pub fn run(&self, enable_rpc_transaction_history: bool) {
-        let transaction_notifier = match self.transaction_notifier {
-            Some(ref notifier) => notifier.clone(),
+    pub fn run(
+        &mut self,
+        enable_rpc_transaction_history: bool,
+        bank: Arc<Bank>,
+    ) {
+        let transaction_notifier = match self.transaction_notifier.take() {
+            Some(notifier) => notifier,
             None => return,
         };
         let transaction_recvr = self.transaction_recvr.clone();
@@ -44,35 +49,33 @@ impl GeyserTransactionNotifyListener {
                 match message {
                     TransactionStatusMessage::Batch(
                         TransactionStatusBatch {
-                            bank,
+                            slot,
                             transactions,
-                            execution_results,
+                            commit_results,
                             balances,
                             token_balances,
-                            transaction_slot_indexes,
-                            ..
+                            transaction_indexes,
                         },
                     ) => {
-                        let slot = bank.slot();
                         for (
                             transaction,
-                            execution_result,
+                            commit_result,
                             pre_balances,
                             post_balances,
                             pre_token_balances,
                             post_token_balances,
-                            transaction_slot_index,
+                            transaction_index,
                         ) in izip!(
                             transactions,
-                            execution_results,
+                            commit_results,
                             balances.pre_balances,
                             balances.post_balances,
                             token_balances.pre_token_balances,
                             token_balances.post_token_balances,
-                            transaction_slot_indexes,
+                            transaction_indexes,
                         ) {
-                            if let Some(details) = execution_result {
-                                let TransactionExecutionDetails {
+                            if let Ok(details) = commit_result {
+                                let CommittedTransaction {
                                     status,
                                     log_messages,
                                     inner_instructions,
@@ -134,7 +137,7 @@ impl GeyserTransactionNotifyListener {
 
                                 transaction_notifier.notify_transaction(
                                     slot,
-                                    transaction_slot_index,
+                                    transaction_index,
                                     transaction.signature(),
                                     &transaction_status_meta,
                                     &transaction,
@@ -152,7 +155,7 @@ impl GeyserTransactionNotifyListener {
                                         slot,
                                         transaction,
                                         transaction_status_meta,
-                                        transaction_slot_index,
+                                        transaction_index,
                                     )
                                         .expect("Expect database write to succeed: TransactionStatus");
                                 }

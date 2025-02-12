@@ -274,6 +274,7 @@ fn process_undelegate_request(
             msg!("ERROR: failed to parse account seeds {:?}", err);
             ProgramError::InvalidArgument
         })?;
+
     undelegate_account(
         delegated_account,
         &crate::id(),

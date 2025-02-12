@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 
+use magicblock_accounts_db::utils::all_accounts;
 use magicblock_ledger::Ledger;
 use num_format::{Locale, ToFormattedString};
 use solana_sdk::{account::ReadableAccount, clock::Epoch, pubkey::Pubkey};
@@ -91,19 +92,19 @@ impl FilterAccounts {
 // -----------------
 // AccountInfo
 // -----------------
-struct AccountInfo<'a> {
+struct AccountInfo {
     /// Pubkey of the account
-    pub pubkey: &'a Pubkey,
+    pub pubkey: Pubkey,
     /// lamports in the account
     pub lamports: u64,
     /// the epoch at which this account will next owe rent
     pub rent_epoch: Epoch,
     /// the program that owns this account. If executable, the program that loads this account.
-    pub owner: &'a Pubkey,
+    pub owner: Pubkey,
     /// this account's data contains a loaded program (and is now read-only)
     pub executable: bool,
     /// the data in this account
-    pub data: &'a [u8],
+    pub data: Vec<u8>,
 }
 
 pub fn print_accounts(
@@ -115,31 +116,37 @@ pub fn print_accounts(
     count: bool,
 ) {
     let (storage, slot) = accounts_storage_from_ledger(ledger);
-
     let mut accounts = {
-        let all = storage.all_accounts();
+        let all = all_accounts(&storage, |acc_meta| AccountInfo {
+            pubkey: *acc_meta.pubkey(),
+            lamports: acc_meta.lamports(),
+            rent_epoch: acc_meta.rent_epoch(),
+            owner: *acc_meta.owner(),
+            executable: acc_meta.executable(),
+            data: acc_meta.data().to_vec(),
+        });
         all.into_iter()
             .filter(|acc| {
-                if !owner.map_or(true, |owner| acc.owner().eq(&owner)) {
+                if !owner.map_or(true, |owner| acc.owner.eq(&owner)) {
                     return false;
                 }
                 if filters.contains(&FilterAccounts::Executable)
-                    && !acc.executable()
+                    && !acc.executable
                 {
                     return false;
                 }
                 if filters.contains(&FilterAccounts::NonExecutable)
-                    && acc.executable()
+                    && acc.executable
                 {
                     return false;
                 }
                 if filters.contains(&FilterAccounts::OnCurve)
-                    && !acc.pubkey().is_on_curve()
+                    && !acc.pubkey.is_on_curve()
                 {
                     return false;
                 }
                 if filters.contains(&FilterAccounts::OffCurve)
-                    && acc.pubkey().is_on_curve()
+                    && acc.pubkey.is_on_curve()
                 {
                     return false;
                 }
@@ -151,12 +158,12 @@ pub fn print_accounts(
     accounts.sort_by(|a, b| {
         use SortAccounts::*;
         match sort {
-            Pubkey => a.pubkey().cmp(b.pubkey()),
-            Owner => a.owner().cmp(b.owner()),
-            Lamports => a.lamports().cmp(&b.lamports()),
-            Executable => a.executable().cmp(&b.executable()),
-            DataLen => a.data().len().cmp(&b.data().len()),
-            RentEpoch => a.rent_epoch().cmp(&b.rent_epoch()),
+            Pubkey => a.pubkey.cmp(&b.pubkey),
+            Owner => a.owner.cmp(&b.owner),
+            Lamports => a.lamports.cmp(&b.lamports),
+            Executable => a.executable.cmp(&b.executable),
+            DataLen => a.data.len().cmp(&b.data.len()),
+            RentEpoch => a.rent_epoch.cmp(&b.rent_epoch),
         }
     });
 
@@ -208,18 +215,7 @@ pub fn print_accounts(
     }
 
     for acc in accounts {
-        add_row(
-            &mut table,
-            AccountInfo {
-                pubkey: acc.pubkey(),
-                lamports: acc.lamports(),
-                rent_epoch: acc.rent_epoch(),
-                owner: acc.owner(),
-                executable: acc.executable(),
-                data: acc.data(),
-            },
-            print_rent_epoch,
-        );
+        add_row(&mut table, acc, print_rent_epoch);
     }
 
     println!("Accounts at slot {}", slot);
