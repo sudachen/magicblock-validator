@@ -1,13 +1,10 @@
 use std::ffi::OsStr;
 
-use magicblock_accounts_db::utils::all_accounts;
-use magicblock_ledger::Ledger;
+use magicblock_accounts_db::AccountsDb;
 use num_format::{Locale, ToFormattedString};
 use solana_sdk::{account::ReadableAccount, clock::Epoch, pubkey::Pubkey};
 use structopt::StructOpt;
 use tabular::{Row, Table};
-
-use crate::utils::accounts_storage_from_ledger;
 
 // -----------------
 // SortAccounts
@@ -108,22 +105,22 @@ struct AccountInfo {
 }
 
 pub fn print_accounts(
-    ledger: &Ledger,
+    adb: &AccountsDb,
     sort: SortAccounts,
     owner: Option<Pubkey>,
     filters: &[FilterAccounts],
     print_rent_epoch: bool,
     count: bool,
 ) {
-    let (storage, slot) = accounts_storage_from_ledger(ledger);
     let mut accounts = {
-        let all = all_accounts(&storage, |acc_meta| AccountInfo {
-            pubkey: *acc_meta.pubkey(),
-            lamports: acc_meta.lamports(),
-            rent_epoch: acc_meta.rent_epoch(),
-            owner: *acc_meta.owner(),
-            executable: acc_meta.executable(),
-            data: acc_meta.data().to_vec(),
+        let iter = adb.iter_all();
+        let all = iter.map(|(pubkey, acc)| AccountInfo {
+            pubkey,
+            lamports: acc.lamports(),
+            rent_epoch: acc.rent_epoch(),
+            owner: *acc.owner(),
+            executable: acc.executable(),
+            data: acc.data().to_vec(),
         });
         all.into_iter()
             .filter(|acc| {
@@ -167,6 +164,7 @@ pub fn print_accounts(
         }
     });
 
+    let slot = adb.slot();
     if count {
         if let Some(owner) = owner {
             println!(

@@ -14,7 +14,7 @@ use rocksdb::Direction as IteratorDirection;
 use solana_measure::measure::Measure;
 use solana_sdk::{
     clock::{Slot, UnixTimestamp},
-    hash::Hash,
+    hash::{Hash, HASH_BYTES},
     pubkey::Pubkey,
     signature::Signature,
     transaction::{SanitizedTransaction, VersionedTransaction},
@@ -284,9 +284,12 @@ impl Ledger {
 
     pub fn get_max_blockhash(&self) -> LedgerResult<(Slot, Hash)> {
         let iter = self.blockhash_cf.iter(IteratorMode::Start)?;
-        let (slot, hash_vec) =
-            iter.max_by_key(|(slot, _)| *slot).unwrap_or_default();
-        let hash = Hash::new(hash_vec.as_ref());
+        let (slot, hash_vec) = iter
+            .max_by_key(|(slot, _)| *slot)
+            .unwrap_or((0, Box::new([0; HASH_BYTES])));
+        let hash = <[u8; HASH_BYTES]>::try_from(hash_vec.as_ref())
+            .map(Hash::new_from_array)
+            .expect("failed to construct hash from slice");
         Ok((slot, hash))
     }
 
@@ -1135,6 +1138,12 @@ impl Ledger {
             &self.account_mod_datas_cf,
             &self.account_mod_data_count,
         )
+    }
+
+    pub fn flush(&self) {
+        let _ = self.db.backend.db.flush().inspect_err(|err| {
+            log::error!("failed to flush ledger (rocksdb): {err}")
+        });
     }
 }
 

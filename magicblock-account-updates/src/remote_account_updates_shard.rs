@@ -17,7 +17,7 @@ use solana_sdk::{
     sysvar::clock,
 };
 use thiserror::Error;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 use tokio_stream::StreamMap;
 use tokio_util::sync::CancellationToken;
 
@@ -33,7 +33,7 @@ pub enum RemoteAccountUpdatesShardError {
 pub struct RemoteAccountUpdatesShard {
     shard_id: String,
     rpc_provider_config: RpcProviderConfig,
-    monitoring_request_receiver: UnboundedReceiver<Pubkey>,
+    monitoring_request_receiver: Receiver<Pubkey>,
     first_subscribed_slots: Arc<RwLock<HashMap<Pubkey, Slot>>>,
     last_known_update_slots: Arc<RwLock<HashMap<Pubkey, Slot>>>,
 }
@@ -42,7 +42,7 @@ impl RemoteAccountUpdatesShard {
     pub fn new(
         shard_id: String,
         rpc_provider_config: RpcProviderConfig,
-        monitoring_request_receiver: UnboundedReceiver<Pubkey>,
+        monitoring_request_receiver: Receiver<Pubkey>,
         first_subscribed_slots: Arc<RwLock<HashMap<Pubkey, Slot>>>,
         last_known_update_slots: Arc<RwLock<HashMap<Pubkey, Slot>>>,
     ) -> Self {
@@ -61,10 +61,10 @@ impl RemoteAccountUpdatesShard {
     ) -> Result<(), RemoteAccountUpdatesShardError> {
         // Create a pubsub client
         info!("Shard {}: Starting", self.shard_id);
-        let pubsub_client =
-            PubsubClient::new(self.rpc_provider_config.ws_url())
-                .await
-                .map_err(RemoteAccountUpdatesShardError::PubsubClientError)?;
+        let ws_url = self.rpc_provider_config.ws_url();
+        let pubsub_client = PubsubClient::new(ws_url)
+            .await
+            .map_err(RemoteAccountUpdatesShardError::PubsubClientError)?;
         // For every account, we only want the updates, not the actual content of the accounts
         let rpc_account_info_config = Some(RpcAccountInfoConfig {
             commitment: self

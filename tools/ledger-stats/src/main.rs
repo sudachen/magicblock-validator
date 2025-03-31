@@ -1,5 +1,6 @@
 use std::{collections::HashSet, path::PathBuf, str::FromStr};
 
+use magicblock_accounts_db::AccountsDb;
 use solana_sdk::pubkey::Pubkey;
 use structopt::StructOpt;
 
@@ -175,7 +176,8 @@ fn main() {
             });
             let filters = accounts::FilterAccounts::from_strings(&filter);
             accounts::print_accounts(
-                &open_ledger(&ledger_path),
+                &AccountsDb::open(&ledger_path)
+                    .expect("adb couldn't be opened"),
                 sort,
                 owner,
                 &filters,
@@ -187,9 +189,10 @@ fn main() {
             ledger_path,
             pubkey,
         } => {
-            let ledger = open_ledger(&ledger_path);
+            let adb =
+                AccountsDb::open(&ledger_path).expect("adb couldn't be opened");
             let pubkey = Pubkey::from_str(&pubkey).expect("Invalid pubkey");
-            account::print_account(&ledger, &pubkey);
+            account::print_account(&adb, &pubkey);
         }
         Blockhash { ledger_path, query } => {
             blockhash::print_blockhash_details(

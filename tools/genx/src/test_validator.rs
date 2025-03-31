@@ -1,3 +1,4 @@
+use magicblock_accounts_db::AccountsDb;
 use serde_json::{json, Value};
 use solana_rpc_client::rpc_client::RpcClient;
 use std::{
@@ -8,8 +9,6 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use ledger_stats::{accounts_storage_from_ledger, open_ledger};
-use magicblock_accounts_db::utils::all_accounts;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use tempfile::tempdir;
 
@@ -29,13 +28,13 @@ pub(crate) fn gen_test_validator_start_script(
 
     let file_path = temp_dir_path.join("run-validator.sh");
     let accounts: Vec<Pubkey> = if let Some(ledger_path) = ledger_path {
-        let ledger = open_ledger(ledger_path);
+        let adb =
+            AccountsDb::open(ledger_path).expect("failed to open accountsdb");
         eprintln!(
-            "Generating test validator script with accounts from ledger: {:?}",
+            "Generating test validator script with accounts from accountsdb: {:?}",
             ledger_path
         );
-        let (storage, _) = accounts_storage_from_ledger(&ledger);
-        all_accounts(&storage, |x| *x.pubkey())
+        adb.iter_all().map(|(pk, _)| pk).collect()
     } else {
         eprintln!("Generating test validator script without accounts");
         vec![]

@@ -79,8 +79,8 @@ async fn main() {
     };
 
     debug!("{:#?}", config);
-    let api = &mut MagicValidator::try_from_config(config, validator_keypair)
-        .unwrap();
+    let mut api =
+        MagicValidator::try_from_config(config, validator_keypair).unwrap();
     debug!("Created API .. starting things up");
 
     // We need to create and hold on to the ledger lock here in order to keep the
@@ -91,7 +91,20 @@ async fn main() {
         ledger::lock_ledger(api.ledger().ledger_path(), &mut ledger_lock);
 
     api.start().await.expect("Failed to start validator");
-    api.join();
+    // validator is supposed to run forever, so we wait for
+    // termination signal to initiate a graceful shutdown
+    let _ = tokio::signal::ctrl_c().await;
+
+    info!("SIGTERM has been received, initiating graceful shutdown");
+    // weird panic behavior in json rpc http server, which panics when stopped from
+    // within async context, so we just move it to a different thread for shutdown
+    //
+    // TODO: once we move rpc out of the validator, this hack will be gone
+    let _ = std::thread::spawn(move || {
+        api.stop();
+        api.join();
+    })
+    .join();
 }
 
 fn validator_keypair() -> Keypair {

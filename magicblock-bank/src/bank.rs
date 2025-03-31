@@ -2,7 +2,9 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     mem,
-    path::PathBuf,
+    num::Saturating,
+    ops::Add,
+    path::Path,
     slice,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
@@ -13,29 +15,29 @@ use std::{
 
 use log::{debug, info, trace};
 use magicblock_accounts_db::{
-    accounts::Accounts, accounts_db::AccountsDb, errors::AccountsDbResult,
-    geyser::AccountsUpdateNotifier,
+    config::AccountsDbConfig, error::AccountsDbError, AccountsDb, StWLock,
 };
 use solana_accounts_db::{
-    accounts_index::ScanConfig, blockhash_queue::BlockhashQueue,
+    accounts_update_notifier_interface::AccountsUpdateNotifierInterface,
+    blockhash_queue::BlockhashQueue,
 };
 use solana_bpf_loader_program::syscalls::{
     create_program_runtime_environment_v1,
     create_program_runtime_environment_v2,
 };
+use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
 use solana_cost_model::cost_tracker::CostTracker;
+use solana_fee::FeeFeatures;
 use solana_geyser_plugin_manager::slot_status_notifier::SlotStatusNotifierImpl;
-use solana_measure::{measure::Measure, measure_us};
+use solana_measure::measure_us;
 use solana_program_runtime::loaded_programs::{
     BlockRelation, ForkGraph, ProgramCacheEntry,
 };
 use solana_rpc::slot_status_notifier::SlotStatusNotifierInterface;
-use solana_runtime_transaction::instructions_processor::process_compute_budget_instructions;
 use solana_sdk::{
     account::{
-        create_account_shared_data_with_fields as create_account, from_account,
-        Account, AccountSharedData, InheritableAccountFields, ReadableAccount,
-        WritableAccount,
+        from_account, Account, AccountSharedData, InheritableAccountFields,
+        ReadableAccount, WritableAccount,
     },
     account_utils::StateMut,
     clock::{
@@ -45,8 +47,8 @@ use solana_sdk::{
     epoch_info::EpochInfo,
     epoch_schedule::EpochSchedule,
     feature,
-    feature_set::{self, FeatureSet},
-    fee::{FeeBudgetLimits, FeeStructure},
+    feature_set::{self, disable_rent_fees_collection, FeatureSet},
+    fee::{FeeBudgetLimits, FeeDetails, FeeStructure},
     fee_calculator::FeeRateGovernor,
     genesis_config::GenesisConfig,
     hash::{Hash, Hasher},
@@ -76,6 +78,7 @@ use solana_svm::{
     },
     account_overrides::AccountOverrides,
     nonce_info::NonceInfo,
+    rollback_accounts::RollbackAccounts,
     runtime_config::RuntimeConfig,
     transaction_commit_result::{
         CommittedTransaction, TransactionCommitResult,
@@ -100,10 +103,10 @@ use solana_timings::{ExecuteTimingType, ExecuteTimings};
 use crate::{
     bank_helpers::{
         calculate_data_size_delta, get_epoch_secs,
-        inherit_specially_retained_account_fields,
+        inherit_specially_retained_account_fields, update_sysvar_data,
     },
-    bank_rc::BankRc,
     builtins::{BuiltinPrototype, BUILTINS},
+    geyser::AccountsUpdateNotifier,
     status_cache::StatusCache,
     transaction_batch::TransactionBatch,
     transaction_logs::{
@@ -114,6 +117,7 @@ use crate::{
         TransactionBalances, TransactionBalancesSet,
     },
     transaction_simulation::TransactionSimulationResult,
+    LAMPORTS_PER_SIGNATURE,
 };
 
 pub type BankStatusCache = StatusCache<Result<()>>;
@@ -143,11 +147,8 @@ impl ForkGraph for SimpleForkGraph {
 // -----------------
 //#[derive(Debug)]
 pub struct Bank {
-    /// References to accounts, parent and signature status
-    pub rc: BankRc,
-
-    /// Bank slot (i.e. block)
-    slot: AtomicU64,
+    /// Shared reference to accounts database
+    pub adb: AccountsDb,
 
     /// Bank epoch
     epoch: Epoch,
@@ -185,9 +186,6 @@ pub struct Bank {
 
     /// A cache of signature statuses
     pub status_cache: Arc<RwLock<BankStatusCache>>,
-
-    // First path provided to accounts db (in our case it is always one)
-    pub accounts_path: PathBuf,
 
     // -----------------
     // Counters
@@ -280,10 +278,14 @@ pub struct Bank {
     // -----------------
     cost_tracker: RwLock<CostTracker>,
 
+    // Everything below is a BS and should be removed
     // -----------------
     // Geyser
     // -----------------
     slot_status_notifier: Option<SlotStatusNotifierImpl>,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
+    // for compatibility, some RPC code needs that flag, which we set to true immediately
+    accounts_verified: Arc<AtomicBool>,
 }
 
 // -----------------
@@ -297,26 +299,21 @@ impl TransactionProcessingCallback for Bank {
         account: &Pubkey,
         owners: &[Pubkey],
     ) -> Option<usize> {
-        self.rc
-            .accounts
-            .accounts_db
-            .account_matches_owners(account, owners)
-            .ok()
+        self.adb.account_matches_owners(account, owners).ok()
     }
 
     fn get_account_shared_data(
         &self,
         pubkey: &Pubkey,
     ) -> Option<AccountSharedData> {
-        self.rc.accounts.accounts_db.load(pubkey)
+        self.adb.get_account(pubkey).map(Into::into).ok()
     }
 
     // NOTE: must hold idempotent for the same set of arguments
     /// Add a builtin program account
     fn add_builtin_account(&self, name: &str, program_id: &Pubkey) {
-        let existing_genuine_program = self
-            .get_account_with_fixed_root(program_id)
-            .and_then(|account| {
+        let existing_genuine_program =
+            self.get_account(program_id).and_then(|account| {
                 // it's very unlikely to be squatted at program_id as non-system account because of burden to
                 // find victim's pubkey/hash. So, when account.owner is indeed native_loader's, it's
                 // safe to assume it's a genuine program.
@@ -348,7 +345,7 @@ impl TransactionProcessingCallback for Bank {
                 &existing_genuine_program,
             ),
         );
-        self.store_account_and_update_capitalization(program_id, &account);
+        self.store_account_and_update_capitalization(program_id, account);
     }
 
     fn inspect_account(
@@ -358,6 +355,23 @@ impl TransactionProcessingCallback for Bank {
         _is_writable: bool,
     ) {
         // we don't need inspections
+    }
+
+    // copied from agave/runtime/src/bank.rs:6931
+    fn calculate_fee(
+        &self,
+        message: &impl SVMMessage,
+        lamports_per_signature: u64,
+        prioritization_fee: u64,
+        feature_set: &FeatureSet,
+    ) -> FeeDetails {
+        solana_fee::calculate_fee_details(
+            message,
+            false, /* zero_fees_for_test */
+            lamports_per_signature,
+            prioritization_fee,
+            FeeFeatures::from(feature_set),
+        )
     }
 }
 
@@ -399,32 +413,35 @@ impl Bank {
     pub fn new(
         genesis_config: &GenesisConfig,
         runtime_config: Arc<RuntimeConfig>,
+        accountsdb_config: &AccountsDbConfig,
         debug_keys: Option<Arc<HashSet<Pubkey>>>,
         additional_builtins: Option<&[BuiltinPrototype]>,
         debug_do_not_add_builtins: bool,
-        accounts_paths: Vec<PathBuf>,
         accounts_update_notifier: Option<AccountsUpdateNotifier>,
         slot_status_notifier: Option<SlotStatusNotifierImpl>,
         millis_per_slot: u64,
         identity_id: Pubkey,
-    ) -> Self {
-        let accounts_path = accounts_paths
-            .first()
-            .expect("At least one accounts path is required")
-            .to_path_buf();
+        lock: StWLock,
+        adb_path: &Path,
+        adb_init_slot: Slot,
+    ) -> std::result::Result<Self, AccountsDbError> {
+        // TODO(bmuddha): When we transition to multi-threaded mode with multiple SVM workers,
+        // every transaction should acquire the read guard on this lock before executing.
 
-        let accounts_db = AccountsDb::new_with_config(
-            &genesis_config.cluster_type,
-            accounts_update_notifier,
-            accounts_paths,
-        );
+        let mut accounts_db =
+            AccountsDb::new(accountsdb_config, adb_path, lock)?;
+        // here we force Accountsdb to match the minimum slot (provided by ledger),
+        // this is the only place where we have a mutable access to the AccountsDb
+        // before it's wrapped in Arc, and thus becomes immutable
+        accounts_db.ensure_at_most(adb_init_slot)?;
 
-        let accounts = Accounts::new(Arc::new(accounts_db));
         let mut bank = Self::default_with_accounts(
-            accounts,
-            accounts_path,
+            accounts_db,
+            accounts_update_notifier,
             millis_per_slot,
         );
+        bank.fee_rate_governor.lamports_per_signature = LAMPORTS_PER_SIGNATURE;
+
         bank.transaction_debug_keys = debug_keys;
         bank.runtime_config = runtime_config;
         bank.slot_status_notifier = slot_status_notifier;
@@ -449,15 +466,14 @@ impl Bank {
         // it via bank.transaction_processor.sysvar_cache.write().unwrap().set_clock(), etc.
         bank.fill_missing_sysvar_cache_entries();
 
-        // We don't have anything to verify at this point, so declare it done
-        bank.set_startup_verification_complete();
+        bank.accounts_verified.store(true, Ordering::Relaxed);
 
-        bank
+        Ok(bank)
     }
 
     pub(super) fn default_with_accounts(
-        accounts: Accounts,
-        accounts_path: PathBuf,
+        adb: AccountsDb,
+        accounts_update_notifier: Option<AccountsUpdateNotifier>,
         millis_per_slot: u64,
     ) -> Self {
         // NOTE: this was not part of the original implementation
@@ -467,10 +483,22 @@ impl Bank {
         // Depending on how fast each slot is computed
         let max_age = DEFAULT_MS_PER_SLOT * MAX_RECENT_BLOCKHASHES as u64
             / millis_per_slot;
+        // Enable some useful features
+        let mut feature_set = FeatureSet::default();
+        // TODO(bmuddha) activate once we merge https://github.com/anza-xyz/agave/pull/4846
+        //
+        // https://github.com/magicblock-labs/magicblock-validator/322
+        //
+        // this allows us to map account's data field directly to
+        // SVM, thus avoiding double copy to and from SVM sandbox
+        // feature_set.activate(&bpf_account_data_direct_mapping::ID, 0);
+
+        // Rent collection is no longer a thing in solana so we don't need to worry about it
+        // https://github.com/solana-foundation/solana-improvement-documents/pull/84
+        feature_set.activate(&disable_rent_fees_collection::ID, 1);
 
         let mut bank = Self {
-            rc: BankRc::new(accounts),
-            slot: AtomicU64::default(),
+            adb,
             epoch: Epoch::default(),
             epoch_schedule: EpochSchedule::default(),
             is_delta: AtomicBool::default(),
@@ -488,7 +516,6 @@ impl Bank {
             millis_per_slot,
             max_age,
             identity_id: Pubkey::default(),
-            accounts_path,
 
             // Counters
             transaction_count: AtomicU64::default(),
@@ -524,6 +551,8 @@ impl Bank {
 
             // Geyser
             slot_status_notifier: Option::<SlotStatusNotifierImpl>::default(),
+            accounts_update_notifier,
+            accounts_verified: Arc::default(),
         };
 
         bank.transaction_processor = {
@@ -622,10 +651,10 @@ impl Bank {
         // present in order to properly activate a feature
         // If not then activating all features results in a panic when executing a transaction
         for (pubkey, account) in genesis_config.accounts.iter() {
-            assert!(
-                self.get_account(pubkey).is_none(),
-                "{pubkey} repeated in genesis config"
-            );
+            // NOTE: previously there was an assertion for making sure that genesis accounts don't
+            // exist in accountsdb, but now this assertion only holds if accountsdb is empty,
+            // otherwise it will contain account from previous validator runs
+
             self.store_account(*pubkey, account.clone().into());
             self.capitalization
                 .fetch_add(account.lamports(), Ordering::Relaxed);
@@ -663,11 +692,11 @@ impl Bank {
     // Slot, Epoch
     // -----------------
     pub fn slot(&self) -> Slot {
-        self.slot.load(Ordering::Relaxed)
+        self.adb.slot()
     }
 
     fn set_slot(&self, slot: Slot) {
-        self.slot.store(slot, Ordering::Relaxed);
+        self.adb.set_slot(slot);
     }
 
     pub fn advance_slot(&self) -> Slot {
@@ -799,90 +828,38 @@ impl Bank {
     // Accounts
     // -----------------
     pub fn has_account(&self, pubkey: &Pubkey) -> bool {
-        self.rc
-            .accounts
-            .accounts_db
-            .accounts_cache
-            .contains_key(pubkey)
+        self.adb.contains_account(pubkey)
     }
 
     pub fn get_account(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
-        self.get_account_modified_slot(pubkey)
-            .map(|(acc, _slot)| acc)
-    }
-
-    pub fn get_account_modified_slot(
-        &self,
-        pubkey: &Pubkey,
-    ) -> Option<(AccountSharedData, Slot)> {
-        self.load_slow(pubkey)
-    }
-
-    pub fn get_account_with_fixed_root(
-        &self,
-        pubkey: &Pubkey,
-    ) -> Option<AccountSharedData> {
-        self.get_account_modified_slot_with_fixed_root(pubkey)
-            .map(|(acc, _slot)| acc)
-    }
-
-    pub fn get_account_modified_slot_with_fixed_root(
-        &self,
-        pubkey: &Pubkey,
-    ) -> Option<(AccountSharedData, Slot)> {
-        self.load_slow_with_fixed_root(pubkey)
-    }
-
-    fn load_slow(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
-        self.rc.accounts.load_with_slot(pubkey)
-    }
-
-    fn load_slow_with_fixed_root(
-        &self,
-        pubkey: &Pubkey,
-    ) -> Option<(AccountSharedData, Slot)> {
-        self.rc.accounts.load_with_slot(pubkey)
+        self.adb.get_account(pubkey).map(Into::into).ok()
     }
 
     /// fn store the single `account` with `pubkey`.
-    /// Uses `store_accounts`, which works on a vector of accounts.
     pub fn store_account(&self, pubkey: Pubkey, account: AccountSharedData) {
-        self.store_accounts(vec![(pubkey, account)])
+        self.adb.insert_account(&pubkey, &account);
+        if let Some(notifier) = &self.accounts_update_notifier {
+            let slot = self.slot();
+            notifier.notify_account_update(slot, &account, &None, &pubkey, 0);
+        }
     }
 
     /// Returns all the accounts this bank can load
     pub fn get_all_accounts(
         &self,
-        sorted: bool,
-    ) -> Vec<(Pubkey, AccountSharedData)> {
-        self.rc.accounts.load_all(sorted)
+        _sorted: bool,
+    ) -> impl Iterator<Item = (Pubkey, AccountSharedData)> + '_ {
+        self.adb.iter_all()
     }
 
     pub fn store_accounts(&self, accounts: Vec<(Pubkey, AccountSharedData)>) {
-        // NOTE: ideally we only have one bank and never freeze it
-        // assert!(!self.freeze_started());
-        //
-        let mut m = Measure::start("stakes_cache.check_and_store");
-
-        /* NOTE: for now disabled this part since we don't support staking
-        let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
-        (0..accounts.len()).for_each(|i| {
-            self.stakes_cache.check_and_store(
-                accounts.pubkey(i),
-                accounts.account(i),
-                new_warmup_cooldown_rate_epoch,
-            )
-        });
-        */
         let slot = self.slot();
-        self.rc.accounts.store_accounts_cached(slot, accounts);
-        m.stop();
-        self.rc
-            .accounts
-            .accounts_db
-            .stats
-            .stakes_cache_check_and_store_us
-            .fetch_add(m.as_us(), Ordering::Relaxed);
+        for (pubkey, acc) in accounts {
+            self.adb.insert_account(&pubkey, &acc);
+            if let Some(notifier) = &self.accounts_update_notifier {
+                notifier.notify_account_update(slot, &acc, &None, &pubkey, 0);
+            }
+        }
     }
 
     /// Technically this issues (or even burns!) new lamports,
@@ -890,10 +867,10 @@ impl Bank {
     fn store_account_and_update_capitalization(
         &self,
         pubkey: &Pubkey,
-        new_account: &AccountSharedData,
+        new_account: AccountSharedData,
     ) {
         let old_account_data_size = if let Some(old_account) =
-            self.get_account_with_fixed_root(pubkey)
+            self.get_account(pubkey)
         {
             match new_account.lamports().cmp(&old_account.lamports()) {
                 std::cmp::Ordering::Greater => {
@@ -937,22 +914,16 @@ impl Bank {
         );
     }
 
-    pub fn flush_accounts_cache(&self) -> AccountsDbResult<u64> {
-        self.rc.accounts.accounts_db.flush_accounts_cache()
-    }
-
     // -----------------
     // Transaction Accounts
     // -----------------
-    pub fn unlock_accounts(&self, batch: &mut TransactionBatch) {
-        if batch.needs_unlock() {
-            batch.set_needs_unlock(false);
-            self.rc.accounts.unlock_accounts(
-                batch.sanitized_transactions().iter(),
-                batch.lock_results(),
-            )
-        }
+    pub fn unlock_accounts(&self, _batch: &mut TransactionBatch) {
+        // TODO(bmuddha), currently we are running in single threaded mode, and we don't have any
+        // locks whatsover (as they are not required), but once we switch to multi-threaded mode we
+        // should implement locking at account level granularity, but locking should be managed by
+        // scheduler, not accountsdb or bank
     }
+
     /// Get the max number of accounts that a transaction may lock in this block
     pub fn get_transaction_account_lock_limit(&self) -> usize {
         if let Some(transaction_account_lock_limit) =
@@ -997,26 +968,20 @@ impl Bank {
     // -----------------
     // GetProgramAccounts
     // -----------------
-    pub fn get_program_accounts(
-        &self,
-        program_id: &Pubkey,
-        config: &ScanConfig,
-    ) -> Vec<TransactionAccount> {
-        self.rc.accounts.load_by_program(program_id, config)
-    }
-
     pub fn get_filtered_program_accounts<F>(
         &self,
         program_id: &Pubkey,
         filter: F,
-        config: &ScanConfig,
     ) -> Vec<TransactionAccount>
     where
         F: Fn(&AccountSharedData) -> bool + Send + Sync,
     {
-        self.rc
-            .accounts
-            .load_by_program_with_filter(program_id, filter, config)
+        self.adb
+            .get_program_accounts(program_id, filter)
+            .inspect_err(|err| {
+                log::error!("failed to load program accounts: {err}")
+            })
+            .unwrap_or_default()
     }
 
     pub fn byte_limit_for_scans(&self) -> Option<usize> {
@@ -1069,20 +1034,14 @@ impl Bank {
             unix_timestamp,
         };
         self.update_sysvar_account(&sysvar::clock::id(), |account| {
-            create_account(
-                &clock,
-                inherit_specially_retained_account_fields(account),
-            )
+            update_sysvar_data(&clock, account)
         });
         self.set_clock_in_sysvar_cache(clock);
     }
 
     fn update_rent(&self) {
         self.update_sysvar_account(&sysvar::rent::id(), |account| {
-            create_account(
-                &self.rent_collector.rent,
-                inherit_specially_retained_account_fields(account),
-            )
+            update_sysvar_data(&self.rent_collector.rent, account)
         });
     }
 
@@ -1093,11 +1052,11 @@ impl Bank {
             .is_active(&feature_set::disable_fees_sysvar::id())
         {
             self.update_sysvar_account(&sysvar::fees::id(), |account| {
-                create_account(
+                update_sysvar_data(
                     &sysvar::fees::Fees::new(
                         &self.fee_rate_governor.create_fee_calculator(),
                     ),
-                    inherit_specially_retained_account_fields(account),
+                    account,
                 )
             });
         }
@@ -1105,10 +1064,7 @@ impl Bank {
 
     fn update_epoch_schedule(&self) {
         self.update_sysvar_account(&sysvar::epoch_schedule::id(), |account| {
-            create_account(
-                self.epoch_schedule(),
-                inherit_specially_retained_account_fields(account),
-            )
+            update_sysvar_data(self.epoch_schedule(), account)
         });
     }
 
@@ -1119,10 +1075,7 @@ impl Bank {
                 .map(|account| from_account::<SlotHistory, _>(account).unwrap())
                 .unwrap_or_default();
             slot_history.add(slot);
-            create_account(
-                &slot_history,
-                inherit_specially_retained_account_fields(account),
-            )
+            update_sysvar_data(&slot_history, account)
         });
     }
     fn update_slot_hashes(&self, prev_slot: Slot, prev_hash: Hash) {
@@ -1132,10 +1085,7 @@ impl Bank {
                 .map(|account| from_account::<SlotHashes, _>(account).unwrap())
                 .unwrap_or_default();
             slot_hashes.add(prev_slot, prev_hash);
-            create_account(
-                &slot_hashes,
-                inherit_specially_retained_account_fields(account),
-            )
+            update_sysvar_data(&slot_hashes, account)
         });
     }
 
@@ -1163,9 +1113,9 @@ impl Bank {
                 self.update_sysvar_account(
                     &sysvar::last_restart_slot::id(),
                     |account| {
-                        create_account(
+                        update_sysvar_data(
                             &LastRestartSlot { last_restart_slot },
-                            inherit_specially_retained_account_fields(account),
+                            account,
                         )
                     },
                 );
@@ -1175,10 +1125,10 @@ impl Bank {
 
     fn update_sysvar_account<F>(&self, pubkey: &Pubkey, updater: F)
     where
-        F: Fn(&Option<AccountSharedData>) -> AccountSharedData,
+        F: Fn(Option<AccountSharedData>) -> AccountSharedData,
     {
-        let old_account = self.get_account_with_fixed_root(pubkey);
-        let mut new_account = updater(&old_account);
+        let old_account = self.get_account(pubkey);
+        let mut new_account = updater(old_account);
 
         // When new sysvar comes into existence (with RENT_UNADJUSTED_INITIAL_BALANCE lamports),
         // this code ensures that the sysvar's balance is adjusted to be rent-exempt.
@@ -1186,7 +1136,7 @@ impl Bank {
         // More generally, this code always re-calculates for possible sysvar data size change,
         // although there is no such sysvars currently.
         self.adjust_sysvar_balance_for_rent(&mut new_account);
-        self.store_account_and_update_capitalization(pubkey, &new_account);
+        self.store_account_and_update_capitalization(pubkey, new_account);
     }
 
     fn adjust_sysvar_balance_for_rent(&self, account: &mut AccountSharedData) {
@@ -1226,13 +1176,12 @@ impl Bank {
         // NOTE: took out the `pending` features since we don't support new feature activations
         // which in Solana only are used when we create a bank from a parent bank
         let mut active = self.feature_set.active.clone();
-        let mut inactive = HashSet::new();
+        let mut inactive = HashSet::default();
         let slot = self.slot();
 
         for feature_id in &self.feature_set.inactive {
             let mut activated = None;
-            if let Some(account) = self.get_account_with_fixed_root(feature_id)
-            {
+            if let Some(account) = self.get_account(feature_id) {
                 if let Some(feature) = feature::from_account(&account) {
                     match feature.activated_at {
                         Some(activation_slot) if slot >= activation_slot => {
@@ -1250,7 +1199,10 @@ impl Bank {
             }
         }
 
-        FeatureSet { active, inactive }
+        FeatureSet {
+            active,
+            inactive: inactive.into(),
+        }
     }
 
     // Looks like this is only used in tests since add_precompiled_account_with_owner is as well
@@ -1271,7 +1223,7 @@ impl Bank {
         program_id: &Pubkey,
         owner: Pubkey,
     ) {
-        if let Some(account) = self.get_account_with_fixed_root(program_id) {
+        if let Some(account) = self.get_account(program_id) {
             if account.executable() {
                 return;
             }
@@ -1296,7 +1248,7 @@ impl Bank {
             executable: true,
             rent_epoch,
         });
-        self.store_account_and_update_capitalization(program_id, &account);
+        self.store_account_and_update_capitalization(program_id, account);
     }
 
     fn burn_and_purge_account(
@@ -1326,11 +1278,7 @@ impl Bank {
         &'a self,
         txs: &'b [SanitizedTransaction],
     ) -> TransactionBatch<'a, 'b> {
-        let tx_account_lock_limit = self.get_transaction_account_lock_limit();
-        let lock_results = self
-            .rc
-            .accounts
-            .lock_accounts(txs.iter(), tx_account_lock_limit);
+        let lock_results = vec![Ok(()); txs.len()];
         TransactionBatch::new(lock_results, self, Cow::Borrowed(txs))
     }
 
@@ -1339,15 +1287,9 @@ impl Bank {
     pub fn prepare_sanitized_batch_with_results<'a, 'b>(
         &'a self,
         transactions: &'b [SanitizedTransaction],
-        transaction_results: impl Iterator<Item = Result<()>>,
+        _transaction_results: impl Iterator<Item = Result<()>>,
     ) -> TransactionBatch<'a, 'b> {
-        // this lock_results could be: Ok, AccountInUse, WouldExceedBlockMaxLimit or WouldExceedAccountMaxLimit
-        let tx_account_lock_limit = self.get_transaction_account_lock_limit();
-        let lock_results = self.rc.accounts.lock_accounts_with_results(
-            transactions.iter(),
-            transaction_results,
-            tx_account_lock_limit,
-        );
+        let lock_results = vec![Ok(()); transactions.len()];
         TransactionBatch::new(lock_results, self, Cow::Borrowed(transactions))
     }
 
@@ -1408,10 +1350,10 @@ impl Bank {
         if let Some(hash_info) =
             hash_queue.get_hash_info_if_valid(recent_blockhash, max_age)
         {
-            Ok(CheckedTransactionDetails {
-                nonce: None,
-                lamports_per_signature: hash_info.lamports_per_signature(),
-            })
+            Ok(CheckedTransactionDetails::new(
+                None,
+                hash_info.lamports_per_signature(),
+            ))
         } else if let Some((nonce, previous_lamports_per_signature)) = self
             .check_load_and_advance_message_nonce_account(
                 tx.message(),
@@ -1419,10 +1361,10 @@ impl Bank {
                 next_lamports_per_signature,
             )
         {
-            Ok(CheckedTransactionDetails {
-                nonce: Some(nonce),
-                lamports_per_signature: previous_lamports_per_signature,
-            })
+            Ok(CheckedTransactionDetails::new(
+                Some(nonce),
+                previous_lamports_per_signature,
+            ))
         } else {
             error_counters.blockhash_not_found += 1;
             Err(TransactionError::BlockhashNotFound)
@@ -1465,7 +1407,7 @@ impl Bank {
         message: &SanitizedMessage,
     ) -> Option<(Pubkey, AccountSharedData, nonce::state::Data)> {
         let nonce_address = message.get_durable_nonce()?;
-        let nonce_account = self.get_account_with_fixed_root(nonce_address)?;
+        let nonce_account = self.get_account(nonce_address)?;
         let nonce_data = nonce_account::verify_nonce_account(
             &nonce_account,
             message.recent_blockhash(),
@@ -1536,15 +1478,21 @@ impl Bank {
         ));
         timings.saturating_add_in_place(ExecuteTimingType::CheckUs, check_us);
 
-        let (blockhash, lamports_per_signature) =
+        let (blockhash, fee_lamports_per_signature) =
             self.last_blockhash_and_lamports_per_signature();
         let processing_environment = TransactionProcessingEnvironment {
             blockhash,
-            epoch_total_stake: None,
-            epoch_vote_accounts: None,
+            epoch_total_stake: u64::MIN, // we don't have stake
             feature_set: Arc::clone(&self.feature_set),
-            fee_structure: Some(&self.fee_structure),
-            lamports_per_signature,
+            fee_lamports_per_signature,
+            // Copied from field definition
+            //
+            // Note: This value is primarily used for nonce accounts. If set to zero,
+            // it will disable transaction fees. However, any non-zero value will not
+            // change transaction fees...
+            //
+            // So we just set it to non-zero value
+            blockhash_lamports_per_signature: fee_lamports_per_signature,
             rent_collector: None,
         };
 
@@ -1580,7 +1528,7 @@ impl Bank {
                         let result = processing_result.flattened_result();
                         info!(
                             "slot: {} result: {:?} tx: {:?}",
-                            self.slot.load(Ordering::Relaxed),
+                            self.slot(),
                             result,
                             tx
                         );
@@ -1608,7 +1556,7 @@ impl Bank {
                         1;
                 }
                 Err(err) => {
-                    if *err_count == 0 {
+                    if err_count.0 == 0 {
                         debug!("tx error: {:?} {:?}", err, tx);
                     }
                     *err_count += 1;
@@ -1673,6 +1621,51 @@ impl Bank {
         )
     }
 
+    fn collect_accounts_to_store<'a, T: SVMMessage>(
+        txs: &'a [T],
+        processing_results: &'a [TransactionProcessingResult],
+    ) -> Vec<(Pubkey, AccountSharedData)> {
+        let collect_capacity =
+            max_number_of_accounts_to_collect(txs, processing_results);
+        let mut accounts = Vec::with_capacity(collect_capacity);
+
+        for (processing_result, transaction) in
+            processing_results.iter().zip(txs)
+        {
+            let Some(processed_tx) = processing_result.processed_transaction()
+            else {
+                // Don't store any accounts if tx wasn't executed
+                continue;
+            };
+
+            match processed_tx {
+                ProcessedTransaction::Executed(executed_tx) => {
+                    if executed_tx.execution_details.status.is_ok() {
+                        collect_accounts_for_successful_tx(
+                            &mut accounts,
+                            transaction,
+                            &executed_tx.loaded_transaction.accounts,
+                        );
+                    } else {
+                        collect_accounts_for_failed_tx(
+                            &mut accounts,
+                            transaction,
+                            &executed_tx.loaded_transaction.rollback_accounts,
+                        );
+                    }
+                }
+                ProcessedTransaction::FeesOnly(fees_only_tx) => {
+                    collect_accounts_for_failed_tx(
+                        &mut accounts,
+                        transaction,
+                        &fees_only_tx.rollback_accounts,
+                    );
+                }
+            }
+        }
+        accounts
+    }
+
     /// `committed_transactions_count` is the number of transactions out of `sanitized_txs`
     /// that was executed. Of those, `committed_transactions_count`,
     /// `committed_with_failure_result_count` is the number of executed transactions that returned
@@ -1717,11 +1710,11 @@ impl Bank {
         }
 
         let ((), store_accounts_us) = measure_us!({
-            self.rc.accounts.store_cached(
-                self.slot(),
+            let accounts = Self::collect_accounts_to_store(
                 sanitized_txs,
                 &processing_results,
             );
+            self.store_accounts(accounts);
         });
         let ((), update_executors_us) = measure_us!({
             let txp = self.transaction_processor.read().unwrap();
@@ -1986,7 +1979,9 @@ impl Bank {
             lamports_per_signature == 0,
             self.fee_structure.lamports_per_signature,
             fee_budget_limits.prioritization_fee,
-            false,
+            FeeFeatures {
+                enable_secp256r1_precompile: false,
+            },
         )
     }
 
@@ -2035,10 +2030,10 @@ impl Bank {
         );
 
         let units_consumed = timings.details.per_program_timings.iter().fold(
-            0,
-            |acc: u64, (_, program_timing)| {
-                acc.saturating_add(program_timing.accumulated_units)
-                    .saturating_add(program_timing.total_errored_units)
+            Saturating(0_u64),
+            |acc: Saturating<u64>, (_, program_timing)| {
+                acc.add(program_timing.accumulated_units)
+                    .add(program_timing.total_errored_units)
             },
         );
 
@@ -2083,7 +2078,7 @@ impl Bank {
             result,
             logs,
             post_simulation_accounts,
-            units_consumed,
+            units_consumed: units_consumed.0,
             return_data,
             inner_instructions,
         }
@@ -2095,18 +2090,14 @@ impl Bank {
     ) -> AccountOverrides {
         let mut account_overrides = AccountOverrides::default();
         let slot_history_id = sysvar::slot_history::id();
-        // For now this won't run properly since we don't support slot_history sysvar
         if account_keys.iter().any(|pubkey| *pubkey == slot_history_id) {
-            let current_account =
-                self.get_account_with_fixed_root(&slot_history_id);
+            let current_account = self.get_account(&slot_history_id);
             let slot_history = current_account
                 .as_ref()
                 .map(|account| from_account::<SlotHistory, _>(account).unwrap())
                 .unwrap_or_default();
             if slot_history.check(self.slot()) == Check::Found {
-                if let Some((account, _)) =
-                    self.load_slow_with_fixed_root(&slot_history_id)
-                {
+                if let Some(account) = self.get_account(&slot_history_id) {
                     account_overrides.set_slot_history(Some(account));
                 }
             }
@@ -2281,20 +2272,7 @@ impl Bank {
     // -----------------
     /// Returns true when startup accounts hash verification has completed or never had to run in background.
     pub fn get_startup_verification_complete(&self) -> &Arc<AtomicBool> {
-        &self
-            .rc
-            .accounts
-            .accounts_db
-            .verify_accounts_hash_in_bg
-            .verified
-    }
-
-    pub fn set_startup_verification_complete(&self) {
-        self.rc
-            .accounts
-            .accounts_db
-            .verify_accounts_hash_in_bg
-            .verification_complete()
+        &self.accounts_verified
     }
 
     // -----------------
@@ -2323,12 +2301,8 @@ impl Bank {
         self.capitalization.load(Ordering::Relaxed)
     }
 
-    pub fn accounts_db_storage_size(&self) -> AccountsDbResult<u64> {
-        self.accounts_db().storage_size()
-    }
-
-    fn accounts_db(&self) -> &AccountsDb {
-        self.rc.accounts.accounts_db.as_ref()
+    pub fn accounts_db_storage_size(&self) -> u64 {
+        self.adb.storage_size()
     }
 
     // -----------------
@@ -2389,7 +2363,6 @@ impl Bank {
     // -----------------
     fn set_next_slot(&self, next_slot: Slot) {
         self.set_slot(next_slot);
-        self.rc.accounts.set_slot(next_slot);
 
         let tx_processor = self.transaction_processor.read().unwrap();
         // Update transaction processor with new slot
@@ -2453,4 +2426,87 @@ impl Bank {
                 .unwrap_or(INITIAL_RENT_EPOCH),
         )
     }
+
+    pub fn flush(&self) {
+        self.adb.flush(true);
+    }
+}
+
+fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
+    collected_accounts: &mut Vec<(Pubkey, AccountSharedData)>,
+    transaction: &'a T,
+    transaction_accounts: &'a [TransactionAccount],
+) {
+    for (i, (address, account)) in
+        (0..transaction.account_keys().len()).zip(transaction_accounts)
+    {
+        if !transaction.is_writable(i) {
+            continue;
+        }
+
+        // Accounts that are invoked and also not passed as an instruction
+        // account to a program don't need to be stored because it's assumed
+        // to be impossible for a committable transaction to modify an
+        // invoked account if said account isn't passed to some program.
+        if transaction.is_invoked(i) && !transaction.is_instruction_account(i) {
+            continue;
+        }
+
+        collected_accounts.push((*address, account.clone()));
+    }
+}
+
+fn collect_accounts_for_failed_tx<'a, T: SVMMessage>(
+    collected_accounts: &mut Vec<(Pubkey, AccountSharedData)>,
+    transaction: &'a T,
+    rollback_accounts: &'a RollbackAccounts,
+) {
+    let fee_payer_address = transaction.fee_payer();
+    match rollback_accounts {
+        RollbackAccounts::FeePayerOnly { fee_payer_account } => {
+            collected_accounts
+                .push((*fee_payer_address, fee_payer_account.clone()));
+        }
+        RollbackAccounts::SameNonceAndFeePayer { nonce } => {
+            collected_accounts
+                .push((*nonce.address(), nonce.account().clone()));
+        }
+        RollbackAccounts::SeparateNonceAndFeePayer {
+            nonce,
+            fee_payer_account,
+        } => {
+            collected_accounts
+                .push((*fee_payer_address, fee_payer_account.clone()));
+
+            collected_accounts
+                .push((*nonce.address(), nonce.account().clone()));
+        }
+    }
+}
+fn max_number_of_accounts_to_collect(
+    txs: &[impl SVMMessage],
+    processing_results: &[TransactionProcessingResult],
+) -> usize {
+    processing_results
+        .iter()
+        .zip(txs)
+        .filter_map(|(processing_result, tx)| {
+            processing_result
+                .processed_transaction()
+                .map(|processed_tx| (processed_tx, tx))
+        })
+        .map(|(processed_tx, tx)| match processed_tx {
+            ProcessedTransaction::Executed(executed_tx) => {
+                match executed_tx.execution_details.status {
+                    Ok(_) => tx.num_write_locks() as usize,
+                    Err(_) => {
+                        executed_tx.loaded_transaction.rollback_accounts.count()
+                    }
+                }
+            }
+            ProcessedTransaction::FeesOnly(fees_only_tx) => {
+                fees_only_tx.rollback_accounts.count()
+            }
+        })
+        .sum()
 }

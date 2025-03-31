@@ -262,7 +262,8 @@ where
             .map(|(pubkey, acc)| (pubkey, *acc.owner()))
             .collect::<HashSet<_>>();
 
-        debug!("Hydrating {} accounts", account_keys.len());
+        let count = account_keys.len();
+        debug!("Hydrating {count} accounts");
         let stream = stream::iter(account_keys);
         // NOTE: depending on the RPC provider we may get rate limited if we request
         // account states at a too high rate.
@@ -274,9 +275,9 @@ where
         // If the optimal rate here is desired we might make this configurable in the
         // future.
         // TODO(GabrielePicco): Make the concurrency configurable
-        stream
+        let result = stream
             .map(Ok::<_, AccountClonerError>)
-            .try_for_each_concurrent(100, |(pubkey, owner)| async move {
+            .try_for_each_concurrent(30, |(pubkey, owner)| async move {
                 trace!("Hydrating '{}'", pubkey);
                 let res = self
                     .do_clone_and_update_cache(
@@ -296,11 +297,14 @@ where
                         error!("Failed to clone {} ('{:?}')", pubkey, err);
                         // NOTE: the account fetch already has retries built in, so
                         // we don't to retry here
+
                         Err(err)
                     }
                 }
             })
-            .await
+            .await;
+        info!("On-startup account ensurance is complete: {count}");
+        result
     }
 
     async fn do_clone_or_use_cache(
@@ -422,6 +426,7 @@ where
             //  - we may not want to track lamport changes, especially for payers
             self.account_updates
                 .ensure_account_monitoring(pubkey)
+                .await
                 .map_err(AccountClonerError::AccountUpdatesError)?;
 
             // Fetch the account, repeat and retry until we have a satisfactory response

@@ -18,10 +18,10 @@ enum Commands {
     #[command(name = "test-validator")]
     #[command(
         about = "Generates a script to run a test validator",
-        long_about = "Example: genx test-validator --rpc-port 7799 --url devnet path/to/ledger"
+        long_about = "Example: genx test-validator --rpc-port 7799 --url devnet path/to/accountsdb"
     )]
     TestValidator {
-        ledger_path: Option<PathBuf>,
+        accountsdb_path: Option<PathBuf>,
 
         #[arg(long)]
         rpc_port: u16,
@@ -35,13 +35,13 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::TestValidator {
-            ledger_path,
+            accountsdb_path,
             rpc_port,
             url,
         } => {
             let config = TestValidatorConfig { rpc_port, url };
             test_validator::gen_test_validator_start_script(
-                ledger_path.as_ref(),
+                accountsdb_path.as_ref(),
                 config,
             )
         }

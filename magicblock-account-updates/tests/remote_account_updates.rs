@@ -49,15 +49,18 @@ async fn test_devnet_monitoring_clock_sysvar_changes_over_time() {
     // Before starting the monitoring, we should know nothing about the clock
     assert!(client.get_last_known_update_slot(&sysvar_clock).is_none());
     // Start the monitoring
-    assert!(client.ensure_account_monitoring(&sysvar_clock).is_ok());
+    assert!(client
+        .ensure_account_monitoring(&sysvar_clock)
+        .await
+        .is_ok());
     // Wait for a few slots to happen on-chain
-    sleep(Duration::from_millis(2000)).await;
+    sleep(Duration::from_millis(2_000)).await;
     // Check that we detected the clock change
     assert!(client.get_last_known_update_slot(&sysvar_clock).is_some());
     let first_slot_detected =
         client.get_last_known_update_slot(&sysvar_clock).unwrap();
     // Wait for a few more slots to happen on-chain (some of the connections should be refreshed now)
-    sleep(Duration::from_millis(2000)).await;
+    sleep(Duration::from_millis(2_000)).await;
     // We should still detect the updates correctly even when the connections are refreshed
     let second_slot_detected =
         client.get_last_known_update_slot(&sysvar_clock).unwrap();
@@ -81,11 +84,14 @@ async fn test_devnet_monitoring_multiple_accounts_at_the_same_time() {
     assert!(client.get_last_known_update_slot(&sysvar_sh).is_none());
     assert!(client.get_last_known_update_slot(&sysvar_clock).is_none());
     // Start monitoring the accounts now
-    assert!(client.ensure_account_monitoring(&sysvar_rent).is_ok());
-    assert!(client.ensure_account_monitoring(&sysvar_sh).is_ok());
-    assert!(client.ensure_account_monitoring(&sysvar_clock).is_ok());
+    assert!(client.ensure_account_monitoring(&sysvar_rent).await.is_ok());
+    assert!(client.ensure_account_monitoring(&sysvar_sh).await.is_ok());
+    assert!(client
+        .ensure_account_monitoring(&sysvar_clock)
+        .await
+        .is_ok());
     // Wait for a few slots to happen on-chain
-    sleep(Duration::from_millis(3000)).await;
+    sleep(Duration::from_millis(2_000)).await;
     // Check that we detected the accounts changes
     assert!(client.get_last_known_update_slot(&sysvar_rent).is_none()); // Rent doesn't change
     assert!(client.get_last_known_update_slot(&sysvar_sh).is_some());
@@ -109,10 +115,10 @@ async fn test_devnet_monitoring_some_accounts_only() {
     assert!(client.get_last_known_update_slot(&sysvar_sh).is_none());
     assert!(client.get_last_known_update_slot(&sysvar_clock).is_none());
     // Start monitoring only some of the accounts
-    assert!(client.ensure_account_monitoring(&sysvar_rent).is_ok());
-    assert!(client.ensure_account_monitoring(&sysvar_sh).is_ok());
+    assert!(client.ensure_account_monitoring(&sysvar_rent).await.is_ok());
+    assert!(client.ensure_account_monitoring(&sysvar_sh).await.is_ok());
     // Wait for a few slots to happen on-chain
-    sleep(Duration::from_millis(3000)).await;
+    sleep(Duration::from_millis(2_000)).await;
     // Check that we detected the accounts changes only on the accounts we monitored
     assert!(client.get_last_known_update_slot(&sysvar_rent).is_none()); // Rent doesn't change
     assert!(client.get_last_known_update_slot(&sysvar_sh).is_some());
@@ -136,11 +142,14 @@ async fn test_devnet_monitoring_invalid_and_immutable_and_program_account() {
     assert!(client.get_last_known_update_slot(&system_program).is_none());
     assert!(client.get_last_known_update_slot(&sysvar_rent).is_none());
     // Start monitoring all accounts
-    assert!(client.ensure_account_monitoring(&new_account).is_ok());
-    assert!(client.ensure_account_monitoring(&system_program).is_ok());
-    assert!(client.ensure_account_monitoring(&sysvar_rent).is_ok());
+    assert!(client.ensure_account_monitoring(&new_account).await.is_ok());
+    assert!(client
+        .ensure_account_monitoring(&system_program)
+        .await
+        .is_ok());
+    assert!(client.ensure_account_monitoring(&sysvar_rent).await.is_ok());
     // Wait for a few slots to happen on-chain
-    sleep(Duration::from_millis(3000)).await;
+    sleep(Duration::from_millis(2_000)).await;
     // We shouldnt have detected any change whatsoever on those
     assert!(client.get_last_known_update_slot(&new_account).is_none());
     assert!(client.get_last_known_update_slot(&system_program).is_none());

@@ -1,8 +1,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use solana_sdk::{
-    account::{AccountSharedData, InheritableAccountFields, ReadableAccount},
+    account::{
+        AccountSharedData, InheritableAccountFields, ReadableAccount,
+        WritableAccount,
+    },
     clock::INITIAL_RENT_EPOCH,
+    sysvar::{self, Sysvar},
 };
 
 /// Compute how much an account has changed size.  This function is useful when the data size delta
@@ -59,4 +63,30 @@ pub(crate) fn get_sys_time_in_secs() -> i64 {
         }
         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
     }
+}
+
+/// Update account data in place if possible.
+///
+/// This is a performance optimization leveraging
+/// the fact that most likely the account will be
+/// of AccountSharedData::Borrowed variant and we
+/// can modify it inplace instead of cloning things
+/// all over the place with extra allocations
+pub(crate) fn update_sysvar_data<S: Sysvar>(
+    sysvar: &S,
+    mut account: Option<AccountSharedData>,
+) -> AccountSharedData {
+    let data_len = bincode::serialized_size(sysvar).unwrap() as usize;
+    let mut account = account.take().unwrap_or_else(|| {
+        AccountSharedData::create(1, vec![], sysvar::ID, false, u64::MAX)
+    });
+    account.resize(data_len, 0);
+    bincode::serialize_into(account.data_as_mut_slice(), sysvar)
+        .inspect_err(|err| {
+            log::error!("failed to bincode serialize sysvar: {err}")
+        })
+        // this should never panic, as we have ensured
+        // the required size for serialization
+        .expect("sysvar data update failed");
+    account
 }

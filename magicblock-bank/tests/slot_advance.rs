@@ -4,7 +4,9 @@
 use log::*;
 use magicblock_bank::bank::Bank;
 use solana_sdk::{
-    account::Account, genesis_config::create_genesis_config, pubkey::Pubkey,
+    account::{accounts_equal, Account},
+    genesis_config::create_genesis_config,
+    pubkey::Pubkey,
     system_program,
 };
 use test_tools_core::init_logger;
@@ -35,15 +37,18 @@ fn test_bank_store_get_accounts_across_slots() {
     init_logger!();
 
     let (genesis_config, _) = create_genesis_config(u64::MAX);
-    let bank = Bank::new_for_tests(&genesis_config, None, None);
+    let bank = Bank::new_for_tests(&genesis_config, None, None).unwrap();
 
     macro_rules! assert_account_stored {
-        ($acc: expr) => {
-            assert_eq!(
-                bank.get_account(&$acc.pubkey).unwrap(),
-                $acc.account.clone().into()
+        ($acc: expr) => {{
+            let account = &bank.get_account(&$acc.pubkey).unwrap();
+            assert!(
+                accounts_equal(account, &$acc.account,),
+                "stored account doesn't match expected value: {:?} <> {:?}",
+                account,
+                $acc.account
             )
-        };
+        }};
     }
 
     macro_rules! assert_account_not_stored {
@@ -100,7 +105,7 @@ fn test_bank_advances_slot_in_clock_sysvar() {
     init_logger!();
 
     let (genesis_config, _) = create_genesis_config(u64::MAX);
-    let bank = Bank::new_for_tests(&genesis_config, None, None);
+    let bank = Bank::new_for_tests(&genesis_config, None, None).unwrap();
 
     assert_eq!(bank.clock().slot, 0);
 

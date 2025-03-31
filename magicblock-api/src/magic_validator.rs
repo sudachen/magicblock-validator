@@ -11,7 +11,6 @@ use std::{
 };
 
 use crate::{
-    accounts::create_accounts_run_and_snapshot_dirs,
     errors::{ApiError, ApiResult},
     external_config::try_convert_accounts_config,
     fund_account::{
@@ -20,7 +19,7 @@ use crate::{
     geyser_transaction_notify_listener::GeyserTransactionNotifyListener,
     init_geyser_service::{init_geyser_service, InitGeyserServiceConfig},
     ledger::{
-        self, ledger_parent_dir, read_validator_keypair_from_ledger,
+        self, read_validator_keypair_from_ledger,
         write_validator_keypair_to_ledger,
     },
     slot::advance_slot_and_update_ledger,
@@ -46,10 +45,14 @@ use magicblock_accounts::{
     utils::try_rpc_cluster_from_cluster, AccountsManager,
 };
 use magicblock_accounts_api::BankAccountProvider;
-use magicblock_accounts_db::geyser::AccountsUpdateNotifier;
+use magicblock_accounts_db::{
+    config::AccountsDbConfig, error::AccountsDbError,
+};
 use magicblock_bank::{
-    bank::Bank, genesis_utils::create_genesis_config_with_leader,
-    geyser::TransactionNotifier, program_loader::load_programs_into_bank,
+    bank::Bank,
+    genesis_utils::create_genesis_config_with_leader,
+    geyser::{AccountsUpdateNotifier, TransactionNotifier},
+    program_loader::load_programs_into_bank,
     transaction_logs::TransactionLogCollectorFilter,
 };
 use magicblock_config::{EphemeralConfig, ProgramConfig};
@@ -57,6 +60,7 @@ use magicblock_geyser_plugin::rpc::GeyserRpcService;
 use magicblock_ledger::{blockstore_processor::process_ledger, Ledger};
 use magicblock_metrics::MetricsService;
 use magicblock_perf_service::SamplePerformanceService;
+use magicblock_processor::execute_transaction::TRANSACTION_INDEX_LOCK;
 use magicblock_program::{init_persister, validator};
 use magicblock_pubsub::pubsub_service::{
     PubsubConfig, PubsubService, PubsubServiceCloseHandle,
@@ -72,8 +76,9 @@ use solana_geyser_plugin_manager::{
     slot_status_notifier::SlotStatusNotifierImpl,
 };
 use solana_sdk::{
-    commitment_config::CommitmentLevel, genesis_config::GenesisConfig,
-    pubkey::Pubkey, signature::Keypair, signer::Signer,
+    clock::Slot, commitment_config::CommitmentLevel,
+    genesis_config::GenesisConfig, pubkey::Pubkey, signature::Keypair,
+    signer::Signer,
 };
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -166,16 +171,25 @@ impl MagicValidator {
             &identity_keypair,
             config.validator_config.ledger.reset,
         )?;
-        let accounts_paths = Self::init_accounts_paths(ledger.ledger_path())?;
 
         let exit = Arc::<AtomicBool>::default();
+        // SAFETY:
+        // this code will never panic as the ledger_path always appends the
+        // rocksdb directory to whatever path is preconfigured for the ledger,
+        // see `Ledger::do_open`, thus this path will always have a parent
+        let adb_path = ledger
+            .ledger_path()
+            .parent()
+            .expect("ledger_path didn't have a parent, should never happen");
         let bank = Self::init_bank(
             Some(geyser_manager.clone()),
             &genesis_config,
+            &config.validator_config.accounts.db,
             config.validator_config.validator.millis_per_slot,
             validator_pubkey,
-            accounts_paths,
-        );
+            adb_path,
+            ledger.get_max_blockhash().map(|(slot, _)| slot)?,
+        )?;
 
         fund_validator_identity(&bank, &validator_pubkey);
         fund_magic_context(&bank);
@@ -338,28 +352,34 @@ impl MagicValidator {
     fn init_bank(
         geyser_manager: Option<Arc<RwLock<GeyserPluginManager>>>,
         genesis_config: &GenesisConfig,
+        accountsdb_config: &AccountsDbConfig,
         millis_per_slot: u64,
         validator_pubkey: Pubkey,
-        accounts_paths: Vec<PathBuf>,
-    ) -> Arc<Bank> {
+        adb_path: &Path,
+        adb_init_slot: Slot,
+    ) -> Result<Arc<Bank>, AccountsDbError> {
         let runtime_config = Default::default();
+        let lock = TRANSACTION_INDEX_LOCK.clone();
         let bank = Bank::new(
             genesis_config,
             runtime_config,
+            accountsdb_config,
             None,
             None,
             false,
-            accounts_paths,
             geyser_manager.clone().map(AccountsUpdateNotifier::new),
             geyser_manager.map(SlotStatusNotifierImpl::new),
             millis_per_slot,
             validator_pubkey,
-        );
+            lock,
+            adb_path,
+            adb_init_slot,
+        )?;
         bank.transaction_log_collector_config
             .write()
             .unwrap()
             .filter = TransactionLogCollectorFilter::All;
-        Arc::new(bank)
+        Ok(Arc::new(bank))
     }
 
     fn init_accounts_manager(
@@ -446,14 +466,6 @@ impl MagicValidator {
         let ledger_shared = Arc::new(ledger);
         init_persister(ledger_shared.clone());
         Ok(ledger_shared)
-    }
-
-    fn init_accounts_paths(ledger_path: &Path) -> ApiResult<Vec<PathBuf>> {
-        let parent = ledger_parent_dir(ledger_path)?;
-        let accounts_dir = parent.join("accounts");
-        let (run_path, _snapshot_path) =
-            create_accounts_run_and_snapshot_dirs(&accounts_dir)?;
-        Ok(vec![run_path])
     }
 
     fn sync_validator_keypair_with_ledger(
@@ -669,9 +681,15 @@ impl MagicValidator {
         self.rpc_service.close();
         PubsubService::close(&self.pubsub_close_handle);
         self.token.cancel();
+        // wait a bit for services to stop
+        thread::sleep(Duration::from_secs(1));
+
+        // we have two memory mapped databases, flush them to disk before exitting
+        self.bank.flush();
+        self.ledger.flush();
     }
 
-    pub fn join(&self) {
+    pub fn join(self) {
         self.rpc_service.join().unwrap();
         if let Some(x) = self.pubsub_handle.write().unwrap().take() {
             x.join().unwrap()
