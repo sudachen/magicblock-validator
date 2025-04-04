@@ -1056,7 +1056,7 @@ dependencies = [
 name = "ephemeral-rollups-sdk"
 version = "0.2.4"
 dependencies = [
- "borsh 1.5.7",
+ "borsh 0.10.4",
  "ephemeral-rollups-sdk-attribute-commit",
  "ephemeral-rollups-sdk-attribute-delegate",
  "ephemeral-rollups-sdk-attribute-ephemeral",
