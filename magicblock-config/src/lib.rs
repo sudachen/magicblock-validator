@@ -6,6 +6,7 @@ use std::{
 };
 
 use errors::{ConfigError, ConfigResult};
+use isocountry::CountryCode;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -219,6 +220,19 @@ impl EphemeralConfig {
                         err
                     )
                 });
+        }
+
+        if let Ok(country_code) = env::var("VALIDATOR_COUNTRY_CODE") {
+            config.validator.country_code = CountryCode::for_alpha2(&country_code).unwrap_or_else(|err| {
+                panic!(
+                    "Failed to parse 'VALIDATOR_COUNTRY_CODE' as CountryCode: {:?}",
+                    err
+                )
+            })
+        }
+
+        if let Ok(fdqn) = env::var("VALIDATOR_FDQN") {
+            config.validator.fdqn = Some(fdqn)
         }
 
         // -----------------

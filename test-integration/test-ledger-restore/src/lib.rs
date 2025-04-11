@@ -65,18 +65,16 @@ fn resolve_programs(
 ) -> Vec<ProgramConfig> {
     programs
         .map(|programs| {
-            let mut resolved_programs = vec![];
-            for program in programs.iter() {
-                let p = path_relative_to_workspace(&format!(
-                    "target/deploy/{}",
-                    &program.path
-                ));
-                resolved_programs.push(ProgramConfig {
+            programs
+                .into_iter()
+                .map(|program| ProgramConfig {
                     id: program.id,
-                    path: p,
-                });
-            }
-            resolved_programs
+                    path: path_relative_to_workspace(&format!(
+                        "target/deploy/{}",
+                        program.path
+                    )),
+                })
+                .collect()
         })
         .unwrap_or_default()
 }

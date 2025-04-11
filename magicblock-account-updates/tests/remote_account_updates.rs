@@ -60,7 +60,7 @@ async fn test_devnet_monitoring_clock_sysvar_changes_over_time() {
     let first_slot_detected =
         client.get_last_known_update_slot(&sysvar_clock).unwrap();
     // Wait for a few more slots to happen on-chain (some of the connections should be refreshed now)
-    sleep(Duration::from_millis(2_000)).await;
+    sleep(Duration::from_millis(3_000)).await;
     // We should still detect the updates correctly even when the connections are refreshed
     let second_slot_detected =
         client.get_last_known_update_slot(&sysvar_clock).unwrap();
